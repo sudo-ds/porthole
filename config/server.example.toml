@@ -1,0 +1,21 @@
+# porthole server configuration (runs on your public droplet).
+# CLI flags override these values.
+#
+# The secret is best supplied via the PORTHOLE_SECRET environment variable or
+# --secret-file rather than written here.
+
+# Address + port for the single ingress listener (control + data connections).
+bind_addr = "0.0.0.0"
+control_port = 7835
+
+# Shared secret. Prefer PORTHOLE_SECRET / --secret-file; uncomment to set inline.
+# secret = "CHANGE_ME"   # generate one with: porthole gen-token
+
+# Range of public ports a client is allowed to request.
+min_port = 10000
+max_port = 20000
+
+# TLS certificate/key (PEM). Auto-generated on first run if missing; the
+# fingerprint is printed at startup — pin it on the client.
+cert_path = "porthole.crt"
+key_path = "porthole.key"

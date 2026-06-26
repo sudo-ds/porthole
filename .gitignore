@@ -1,0 +1,6 @@
+/target
+*.crt
+*.key
+*.pem
+porthole.env
+.claude/

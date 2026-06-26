@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>porthole</title>
+<style>
+  :root { --bg:#0f1419; --panel:#1a212b; --line:#2a3441; --fg:#e6edf3; --muted:#8b97a6;
+          --up:#3fb950; --down:#f85149; --accent:#58a6ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  header { display:flex; align-items:center; gap:12px; padding:16px 24px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:18px; margin:0; letter-spacing:1px; }
+  .dot { width:10px; height:10px; border-radius:50%; display:inline-block; }
+  .up { background:var(--up); } .down { background:var(--down); }
+  .meta { color:var(--muted); margin-left:auto; font-size:12px; text-align:right; }
+  main { padding:24px; max-width:1000px; margin:0 auto; }
+  table { width:100%; border-collapse:collapse; margin-bottom:24px; }
+  th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; }
+  td.public a { color:var(--accent); text-decoration:none; }
+  .pill { font-size:11px; padding:2px 8px; border-radius:10px; border:1px solid var(--line); color:var(--muted); }
+  .tcp { color:#79c0ff; } .udp { color:#d2a8ff; }
+  button { background:var(--panel); color:var(--fg); border:1px solid var(--line);
+           border-radius:6px; padding:5px 10px; cursor:pointer; font:inherit; }
+  button:hover { border-color:var(--accent); }
+  button.danger:hover { border-color:var(--down); color:var(--down); }
+  form { display:flex; flex-wrap:wrap; gap:8px; align-items:end; background:var(--panel);
+         border:1px solid var(--line); border-radius:8px; padding:16px; }
+  label { display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--muted); }
+  input, select { background:var(--bg); color:var(--fg); border:1px solid var(--line);
+                  border-radius:6px; padding:6px 8px; font:inherit; }
+  h2 { font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:1px; }
+  .empty { color:var(--muted); padding:16px 0; }
+</style>
+</head>
+<body>
+<header>
+  <span id="conn" class="dot down"></span>
+  <h1>porthole</h1>
+  <div class="meta">
+    <div>server: <span id="server">—</span></div>
+    <div>uptime: <span id="uptime">—</span></div>
+  </div>
+</header>
+<main>
+  <h2>Tunnels</h2>
+  <table>
+    <thead><tr>
+      <th>Name</th><th>Proto</th><th>Local</th><th>Public</th>
+      <th>In</th><th>Out</th><th>Conns</th><th></th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div id="empty" class="empty" hidden>No tunnels yet — add one below.</div>
+
+  <h2>Add tunnel</h2>
+  <form id="add">
+    <label>Name<input name="name" placeholder="minecraft" required></label>
+    <label>Proto<select name="proto"><option>tcp</option><option>udp</option></select></label>
+    <label>Local address<input name="local" placeholder="127.0.0.1:25565" required></label>
+    <label>Public port<input name="remote_port" type="number" min="0" max="65535" placeholder="25565"></label>
+    <button type="submit">Add</button>
+  </form>
+</main>
+<script>
+const fmtBytes = n => {
+  const u = ['B','KB','MB','GB','TB']; let i = 0;
+  while (n >= 1024 && i < u.length-1) { n /= 1024; i++; }
+  return (i ? n.toFixed(1) : n) + ' ' + u[i];
+};
+const fmtDur = s => {
+  const d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
+  if (d) return `${d}d ${h}h`; if (h) return `${h}h ${m}m`; if (m) return `${m}m`; return `${s}s`;
+};
+async function refresh() {
+  let st;
+  try { st = await (await fetch('/api/status')).json(); }
+  catch { document.getElementById('conn').className = 'dot down'; return; }
+  document.getElementById('conn').className = 'dot ' + (st.connected ? 'up' : 'down');
+  document.getElementById('server').textContent = st.server;
+  document.getElementById('uptime').textContent = fmtDur(st.uptime_secs);
+  const rows = document.getElementById('rows');
+  rows.innerHTML = '';
+  document.getElementById('empty').hidden = st.tunnels.length > 0;
+  for (const t of st.tunnels) {
+    const tr = document.createElement('tr');
+    const dot = `<span class="dot ${t.up ? 'up':'down'}" title="${t.up?'live':'down'}"></span>`;
+    const pub = t.public ? `<a href="//${t.public}">${t.public}</a>` : '<span class="pill">pending</span>';
+    const en = t.enabled ? 'disable' : 'enable';
+    tr.innerHTML =
+      `<td>${dot} ${t.name}</td>` +
+      `<td class="${t.proto}">${t.proto}</td>` +
+      `<td>${t.local}</td>` +
+      `<td class="public">${pub}</td>` +
+      `<td>${fmtBytes(t.bytes_in)}</td>` +
+      `<td>${fmtBytes(t.bytes_out)}</td>` +
+      `<td>${t.active}</td>` +
+      `<td><button data-toggle="${t.name}">${en}</button> ` +
+      `<button class="danger" data-remove="${t.name}">remove</button></td>`;
+    rows.appendChild(tr);
+  }
+}
+document.getElementById('rows').addEventListener('click', async e => {
+  const tg = e.target.getAttribute('data-toggle');
+  const rm = e.target.getAttribute('data-remove');
+  if (tg) await fetch(`/api/tunnels/${encodeURIComponent(tg)}/toggle`, {method:'POST'});
+  if (rm) await fetch(`/api/tunnels/${encodeURIComponent(rm)}`, {method:'DELETE'});
+  if (tg || rm) refresh();
+});
+document.getElementById('add').addEventListener('submit', async e => {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  const body = { name: f.get('name'), proto: f.get('proto'), local: f.get('local') };
+  const rp = f.get('remote_port');
+  if (rp) body.remote_port = parseInt(rp, 10);
+  const res = await fetch('/api/tunnels', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  if (res.ok) { e.target.reset(); refresh(); }
+  else alert(await res.text());
+});
+refresh();
+setInterval(refresh, 1500);
+</script>
+</body>
+</html>

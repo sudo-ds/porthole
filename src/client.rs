@@ -1,0 +1,460 @@
+//! Tunnel client: maintains the control connection (with auto-reconnect), registers
+//! tunnels, dials data connections on demand, and exposes shared state to the web UI.
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
+use dashmap::DashMap;
+use futures::stream::SplitSink;
+use futures::{SinkExt, StreamExt};
+use rand::Rng;
+use rustls::pki_types::ServerName;
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::TlsConnector;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+use crate::config::{save_client_file, ClientFile, ClientSettings, TunnelConfig};
+use crate::protocol::{
+    self, ClientMessage, Proto, ServerMessage, Wire, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT,
+};
+use crate::{net, tcp, tls, udp, web};
+
+/// A client-side TLS stream over TCP.
+pub type ClientTls = TlsStream<TcpStream>;
+
+#[derive(Default)]
+pub struct Counters {
+    pub bytes_in: AtomicU64,
+    pub bytes_out: AtomicU64,
+    pub active: AtomicU32,
+}
+
+/// Live status for one tunnel (shared with the web UI).
+pub struct TunnelStatus {
+    pub proto: Proto,
+    pub local_addr: SocketAddr,
+    pub remote_port: Option<u16>,
+    pub enabled: AtomicBool,
+    pub public_addr: Mutex<Option<String>>,
+    pub up: AtomicBool,
+    pub counters: Arc<Counters>,
+}
+
+/// State shared between the control loop, data tasks, and the web UI.
+pub struct ClientShared {
+    pub server_addr: String,
+    pub secret: String,
+    pub connector: TlsConnector,
+    pub server_name: ServerName<'static>,
+    pub config_path: Option<PathBuf>,
+    pub file: Mutex<ClientFile>,
+    /// Sender into the current control connection's writer, if connected.
+    pub out: Mutex<Option<mpsc::Sender<ClientMessage>>>,
+    pub status: DashMap<String, TunnelStatus>,
+    pub connected: AtomicBool,
+    pub started: Instant,
+    pub shutdown: CancellationToken,
+}
+
+/// Mutations requested by the web UI, drained by the single command processor.
+pub enum Command {
+    Add(TunnelConfig),
+    Remove(String),
+    SetEnabled(String, bool),
+}
+
+pub async fn run(settings: ClientSettings) -> Result<()> {
+    let connector = tls::client_connector(&settings.server_fingerprint)?;
+    let server_name = tls::pinned_server_name();
+    let web_bind = settings.web_bind.clone();
+
+    let status: DashMap<String, TunnelStatus> = DashMap::new();
+    for t in &settings.file.tunnels {
+        status.insert(t.name.clone(), status_from(t));
+    }
+
+    let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
+
+    let shared = Arc::new(ClientShared {
+        server_addr: settings.server_addr.clone(),
+        secret: settings.secret.clone(),
+        connector,
+        server_name,
+        config_path: settings.config_path.clone(),
+        file: Mutex::new(settings.file.clone()),
+        out: Mutex::new(None),
+        status,
+        connected: AtomicBool::new(false),
+        started: Instant::now(),
+        shutdown: CancellationToken::new(),
+    });
+
+    tokio::spawn(command_processor(shared.clone(), cmd_rx));
+
+    {
+        let shared = shared.clone();
+        let cmd_tx = cmd_tx.clone();
+        let bind = web_bind.clone();
+        tokio::spawn(async move {
+            if let Err(e) = web::serve(shared, cmd_tx, bind).await {
+                tracing::error!("web UI failed: {e:#}");
+            }
+        });
+    }
+
+    {
+        let shutdown = shared.shutdown.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            shutdown.cancel();
+        });
+    }
+
+    tracing::info!("porthole client: web UI at http://{web_bind}");
+    reconnect_supervisor(shared).await;
+    Ok(())
+}
+
+fn status_from(t: &TunnelConfig) -> TunnelStatus {
+    TunnelStatus {
+        proto: t.protocol,
+        local_addr: t.local_addr,
+        remote_port: t.remote_port,
+        enabled: AtomicBool::new(t.enabled),
+        public_addr: Mutex::new(None),
+        up: AtomicBool::new(false),
+        counters: Arc::new(Counters::default()),
+    }
+}
+
+fn ensure_status(shared: &ClientShared, t: &TunnelConfig) {
+    match shared.status.get(&t.name) {
+        Some(s) => s.enabled.store(t.enabled, Relaxed),
+        None => {
+            shared.status.insert(t.name.clone(), status_from(t));
+        }
+    }
+}
+
+async fn reconnect_supervisor(shared: Arc<ClientShared>) {
+    let max = Duration::from_secs(30);
+    let mut backoff = Duration::from_secs(1);
+
+    loop {
+        if shared.shutdown.is_cancelled() {
+            break;
+        }
+        let started = Instant::now();
+        match connect_and_run(&shared).await {
+            Ok(()) => tracing::info!("control connection closed"),
+            Err(e) => tracing::warn!("control connection error: {e:#}"),
+        }
+
+        shared.connected.store(false, Relaxed);
+        *shared.out.lock().unwrap() = None;
+        for s in shared.status.iter() {
+            s.up.store(false, Relaxed);
+        }
+
+        if shared.shutdown.is_cancelled() {
+            break;
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            backoff = Duration::from_secs(1); // it was a healthy connection
+        }
+        let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..500));
+        let wait = backoff + jitter;
+        tracing::info!("reconnecting in {wait:?}");
+        tokio::select! {
+            _ = shared.shutdown.cancelled() => break,
+            _ = tokio::time::sleep(wait) => {}
+        }
+        backoff = (backoff * 2).min(max);
+    }
+}
+
+async fn connect_and_run(shared: &Arc<ClientShared>) -> Result<()> {
+    tracing::info!("connecting to {}", shared.server_addr);
+    let tcp = TcpStream::connect(&shared.server_addr)
+        .await
+        .context("connecting to server")?;
+    net::set_keepalive(&tcp);
+    let tls = shared
+        .connector
+        .connect(shared.server_name.clone(), tcp)
+        .await
+        .context("tls handshake (check the pinned fingerprint)")?;
+    let mut wire = protocol::wire(tls);
+
+    protocol::send_msg(
+        &mut wire,
+        &ClientMessage::Hello {
+            token: shared.secret.clone(),
+        },
+    )
+    .await?;
+    shared.connected.store(true, Relaxed);
+    tracing::info!("connected");
+
+    let conn_cancel = shared.shutdown.child_token();
+    let (sink, mut stream) = wire.split();
+    let (out_tx, out_rx) = mpsc::channel::<ClientMessage>(128);
+    *shared.out.lock().unwrap() = Some(out_tx.clone());
+
+    spawn_writer(sink, out_rx, conn_cancel.clone());
+
+    // Heartbeat.
+    {
+        let out_tx = out_tx.clone();
+        let cancel = conn_cancel.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = ticker.tick() => {
+                        if out_tx.send(ClientMessage::Heartbeat).await.is_err() { break; }
+                    }
+                }
+            }
+        });
+    }
+
+    // Register all enabled tunnels.
+    let enabled: Vec<TunnelConfig> = shared
+        .file
+        .lock()
+        .unwrap()
+        .tunnels
+        .iter()
+        .filter(|t| t.enabled)
+        .cloned()
+        .collect();
+    for t in &enabled {
+        ensure_status(shared, t);
+        let _ = out_tx
+            .send(ClientMessage::Register {
+                name: t.name.clone(),
+                proto: t.protocol,
+                remote_port: t.remote_port,
+            })
+            .await;
+    }
+
+    let outcome = loop {
+        match tokio::time::timeout(LIVENESS_TIMEOUT, stream.next()).await {
+            Err(_) => break Err(anyhow!("liveness timeout")),
+            Ok(None) => break Ok(()),
+            Ok(Some(Err(e))) => break Err(e.into()),
+            Ok(Some(Ok(frame))) => match serde_json::from_slice::<ServerMessage>(&frame) {
+                Ok(ServerMessage::Accepted {
+                    name,
+                    proto,
+                    remote_port,
+                    token,
+                    ..
+                }) => {
+                    apply_accepted(shared, &conn_cancel, name, proto, remote_port, token);
+                }
+                Ok(ServerMessage::NewConn { id, tunnel }) => {
+                    tokio::spawn(tcp::client_handle_conn(
+                        shared.clone(),
+                        id,
+                        tunnel,
+                        conn_cancel.clone(),
+                    ));
+                }
+                Ok(ServerMessage::Heartbeat) => {}
+                Ok(ServerMessage::Error { message, fatal }) => {
+                    tracing::warn!("server: {message}");
+                    if fatal {
+                        break Err(anyhow!("server rejected us: {message}"));
+                    }
+                }
+                Err(e) => break Err(e.into()),
+            },
+        }
+    };
+
+    conn_cancel.cancel();
+    outcome
+}
+
+fn apply_accepted(
+    shared: &Arc<ClientShared>,
+    conn_cancel: &CancellationToken,
+    name: String,
+    proto: Proto,
+    remote_port: u16,
+    token: Option<Uuid>,
+) {
+    let public = format!("{}:{}", host_of(&shared.server_addr), remote_port);
+    if let Some(s) = shared.status.get(&name) {
+        *s.public_addr.lock().unwrap() = Some(public.clone());
+        s.up.store(true, Relaxed);
+    }
+    tracing::info!("tunnel '{name}' ({proto}) is live at {public}");
+
+    if proto == Proto::Udp {
+        if let Some(token) = token {
+            let (local, counters) = match shared.status.get(&name) {
+                Some(s) => (s.local_addr, s.counters.clone()),
+                None => return,
+            };
+            tokio::spawn(udp::client_channel(
+                shared.clone(),
+                name,
+                local,
+                token,
+                counters,
+                conn_cancel.clone(),
+            ));
+        }
+    }
+}
+
+fn spawn_writer(
+    mut sink: SplitSink<Wire<ClientTls>, Bytes>,
+    mut out_rx: mpsc::Receiver<ClientMessage>,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                msg = out_rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    match serde_json::to_vec(&msg) {
+                        Ok(bytes) => {
+                            if sink.send(Bytes::from(bytes)).await.is_err() { break; }
+                        }
+                        Err(e) => tracing::error!("serialize: {e}"),
+                    }
+                }
+            }
+        }
+        let _ = sink.close().await;
+    });
+}
+
+/// Open a data connection identified by `id` (a TCP conn id or a UDP tunnel token).
+pub async fn connect_data_wire(shared: &ClientShared, id: Uuid) -> Result<Wire<ClientTls>> {
+    let tcp = TcpStream::connect(&shared.server_addr).await?;
+    net::set_keepalive(&tcp);
+    let tls = shared
+        .connector
+        .connect(shared.server_name.clone(), tcp)
+        .await?;
+    let mut wire = protocol::wire(tls);
+    protocol::send_msg(
+        &mut wire,
+        &ClientMessage::DataHello {
+            token: shared.secret.clone(),
+            id,
+        },
+    )
+    .await?;
+    Ok(wire)
+}
+
+// ---------------------------------------------------------------------------
+// Web command processing (the single owner of config write-back)
+// ---------------------------------------------------------------------------
+
+async fn command_processor(shared: Arc<ClientShared>, mut cmd_rx: mpsc::Receiver<Command>) {
+    while let Some(cmd) = cmd_rx.recv().await {
+        match cmd {
+            Command::Add(t) => {
+                ensure_status(&shared, &t);
+                {
+                    let mut f = shared.file.lock().unwrap();
+                    f.tunnels.retain(|x| x.name != t.name);
+                    f.tunnels.push(t.clone());
+                    persist(&shared, &f);
+                }
+                if t.enabled {
+                    send_if_connected(
+                        &shared,
+                        ClientMessage::Register {
+                            name: t.name.clone(),
+                            proto: t.protocol,
+                            remote_port: t.remote_port,
+                        },
+                    )
+                    .await;
+                }
+                tracing::info!("added tunnel '{}'", t.name);
+            }
+            Command::Remove(name) => {
+                {
+                    let mut f = shared.file.lock().unwrap();
+                    f.tunnels.retain(|x| x.name != name);
+                    persist(&shared, &f);
+                }
+                shared.status.remove(&name);
+                send_if_connected(&shared, ClientMessage::Unregister { name: name.clone() }).await;
+                tracing::info!("removed tunnel '{name}'");
+            }
+            Command::SetEnabled(name, enabled) => {
+                let found = {
+                    let mut f = shared.file.lock().unwrap();
+                    let found = f.tunnels.iter_mut().find(|t| t.name == name).map(|t| {
+                        t.enabled = enabled;
+                        t.clone()
+                    });
+                    persist(&shared, &f);
+                    found
+                };
+                if let Some(t) = found {
+                    ensure_status(&shared, &t);
+                    if enabled {
+                        send_if_connected(
+                            &shared,
+                            ClientMessage::Register {
+                                name: name.clone(),
+                                proto: t.protocol,
+                                remote_port: t.remote_port,
+                            },
+                        )
+                        .await;
+                    } else {
+                        if let Some(s) = shared.status.get(&name) {
+                            s.up.store(false, Relaxed);
+                        }
+                        send_if_connected(&shared, ClientMessage::Unregister { name }).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn send_if_connected(shared: &Arc<ClientShared>, msg: ClientMessage) {
+    let out = shared.out.lock().unwrap().clone();
+    if let Some(out) = out {
+        let _ = out.send(msg).await;
+    }
+}
+
+fn persist(shared: &ClientShared, file: &ClientFile) {
+    if let Some(path) = &shared.config_path {
+        if let Err(e) = save_client_file(path, file) {
+            tracing::warn!("persisting config: {e:#}");
+        }
+    }
+}
+
+fn host_of(addr: &str) -> &str {
+    match addr.rfind(':') {
+        Some(i) => &addr[..i],
+        None => addr,
+    }
+}

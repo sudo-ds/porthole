@@ -1,0 +1,25 @@
+[Unit]
+Description=porthole tunnel server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/porthole server --config /etc/porthole/server.toml
+Environment=RUST_LOG=info
+# Put PORTHOLE_SECRET=... in this file (chmod 600) to keep it out of argv/ps.
+EnvironmentFile=/etc/porthole/porthole.env
+Restart=always
+RestartSec=2
+
+# Hardening: run as a transient unprivileged user with a private state dir.
+DynamicUser=yes
+StateDirectory=porthole
+WorkingDirectory=/var/lib/porthole
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+# Only needed to expose ports below 1024:
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

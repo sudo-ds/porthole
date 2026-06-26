@@ -1,0 +1,28 @@
+# porthole client configuration (runs on the machine behind NAT).
+# CLI flags override these; --tunnel specs on the command line are appended.
+
+server_addr = "your.droplet.example.com:7835"
+
+# Pin the server's certificate fingerprint (the server prints it at startup).
+server_fingerprint = "sha256:REPLACE_WITH_SERVER_FINGERPRINT"
+
+# Local web UI (loopback only — do not expose this).
+web_bind = "127.0.0.1:4040"
+
+# Shared secret. Prefer PORTHOLE_SECRET / --secret-file; uncomment to set inline.
+# secret = "CHANGE_ME"   # must match the server
+
+# Each tunnel exposes a local service on a public port of the server.
+# remote_port is optional (omit or 0 => the server assigns one).
+[[tunnels]]
+name = "minecraft"
+protocol = "tcp"
+local_addr = "127.0.0.1:25565"
+remote_port = 25565
+
+[[tunnels]]
+name = "valheim"
+protocol = "udp"
+local_addr = "127.0.0.1:2456"
+remote_port = 2456
+enabled = true
