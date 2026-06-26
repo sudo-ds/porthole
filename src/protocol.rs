@@ -96,6 +96,11 @@ pub enum ClientMessage {
 /// Sent server -> client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerMessage {
+    /// First frame after a successful control `Hello`: the allowed public-port range.
+    Welcome {
+        min_port: u16,
+        max_port: u16,
+    },
     /// A tunnel was granted. `token` (UDP only) is the capability for its data channel.
     Accepted {
         name: String,
@@ -103,6 +108,11 @@ pub enum ServerMessage {
         public_addr: String,
         remote_port: u16,
         token: Option<Uuid>,
+    },
+    /// A registration was refused (port out of range, already in use, ...).
+    Rejected {
+        name: String,
+        reason: String,
     },
     /// A public TCP connection arrived; dial back a data connection with this id.
     NewConn {

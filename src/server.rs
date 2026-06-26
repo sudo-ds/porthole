@@ -162,7 +162,17 @@ impl Server {
     }
 
     /// A control connection: register tunnels and relay notifications until it drops.
-    async fn handle_control(&self, wire: Wire<ServerTls>, peer: SocketAddr) -> Result<()> {
+    async fn handle_control(&self, mut wire: Wire<ServerTls>, peer: SocketAddr) -> Result<()> {
+        // Advertise the allowed public-port range so the client can validate requests.
+        protocol::send_msg(
+            &mut wire,
+            &ServerMessage::Welcome {
+                min_port: self.settings.min_port,
+                max_port: self.settings.max_port,
+            },
+        )
+        .await?;
+
         let session_id = Uuid::new_v4();
         let cancel = CancellationToken::new();
         let (mut sink, mut stream) = wire.split();
@@ -254,10 +264,13 @@ impl Server {
             Some(p) => {
                 if !self.settings.port_allowed(p) {
                     let _ = tx
-                        .send(reject(format!(
-                            "port {p} is outside the allowed range {}-{}",
-                            self.settings.min_port, self.settings.max_port
-                        )))
+                        .send(ServerMessage::Rejected {
+                            name,
+                            reason: format!(
+                                "port {p} is outside the allowed range {}-{}",
+                                self.settings.min_port, self.settings.max_port
+                            ),
+                        })
                         .await;
                     return;
                 }
@@ -355,9 +368,10 @@ impl Server {
         }
 
         let _ = tx
-            .send(reject(format!(
-                "no public port available for tunnel '{name}'"
-            )))
+            .send(ServerMessage::Rejected {
+                name: name.clone(),
+                reason: format!("no public port available for tunnel '{name}'"),
+            })
             .await;
     }
 
@@ -398,12 +412,5 @@ fn auth_error() -> ServerMessage {
     ServerMessage::Error {
         message: "authentication failed".into(),
         fatal: true,
-    }
-}
-
-fn reject(message: String) -> ServerMessage {
-    ServerMessage::Error {
-        message,
-        fatal: false,
     }
 }

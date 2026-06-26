@@ -21,6 +21,8 @@
   th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; }
   td.public a { color:var(--accent); text-decoration:none; }
   .pill { font-size:11px; padding:2px 8px; border-radius:10px; border:1px solid var(--line); color:var(--muted); }
+  .err { color:var(--down); font-size:12px; }
+  .hint { color:var(--muted); font-weight:normal; }
   .tcp { color:#79c0ff; } .udp { color:#d2a8ff; }
   button { background:var(--panel); color:var(--fg); border:1px solid var(--line);
            border-radius:6px; padding:5px 10px; cursor:pointer; font:inherit; }
@@ -60,7 +62,7 @@
     <label>Name<input name="name" placeholder="minecraft" required></label>
     <label>Proto<select name="proto"><option>tcp</option><option>udp</option></select></label>
     <label>Local address<input name="local" placeholder="127.0.0.1:25565" required></label>
-    <label>Public port<input name="remote_port" type="number" min="0" max="65535" placeholder="25565"></label>
+    <label>Public port <small id="range" class="hint"></small><input name="remote_port" type="number" min="0" max="65535" placeholder="25565"></label>
     <button type="submit">Add</button>
   </form>
 </main>
@@ -81,13 +83,16 @@ async function refresh() {
   document.getElementById('conn').className = 'dot ' + (st.connected ? 'up' : 'down');
   document.getElementById('server').textContent = st.server;
   document.getElementById('uptime').textContent = fmtDur(st.uptime_secs);
+  document.getElementById('range').textContent = st.max_port ? `(allowed ${st.min_port}-${st.max_port})` : '';
   const rows = document.getElementById('rows');
   rows.innerHTML = '';
   document.getElementById('empty').hidden = st.tunnels.length > 0;
   for (const t of st.tunnels) {
     const tr = document.createElement('tr');
     const dot = `<span class="dot ${t.up ? 'up':'down'}" title="${t.up?'live':'down'}"></span>`;
-    const pub = t.public ? `<a href="//${t.public}">${t.public}</a>` : '<span class="pill">pending</span>';
+    const pub = t.error ? `<span class="err" title="${t.error}">${t.error}</span>`
+              : t.public ? `<a href="//${t.public}">${t.public}</a>`
+              : '<span class="pill">pending</span>';
     const en = t.enabled ? 'disable' : 'enable';
     tr.innerHTML =
       `<td>${dot} ${t.name}</td>` +

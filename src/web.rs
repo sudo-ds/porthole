@@ -54,6 +54,8 @@ struct StatusResponse {
     connected: bool,
     server: String,
     uptime_secs: u64,
+    min_port: u16,
+    max_port: u16,
     tunnels: Vec<TunnelView>,
 }
 
@@ -66,6 +68,7 @@ struct TunnelView {
     public: Option<String>,
     enabled: bool,
     up: bool,
+    error: Option<String>,
     bytes_in: u64,
     bytes_out: u64,
     active: u32,
@@ -86,6 +89,7 @@ async fn status(State(st): State<AppState>) -> Json<StatusResponse> {
                 public: s.public_addr.lock().unwrap().clone(),
                 enabled: s.enabled.load(Relaxed),
                 up: s.up.load(Relaxed),
+                error: s.error.lock().unwrap().clone(),
                 bytes_in: s.counters.bytes_in.load(Relaxed),
                 bytes_out: s.counters.bytes_out.load(Relaxed),
                 active: s.counters.active.load(Relaxed),
@@ -98,6 +102,8 @@ async fn status(State(st): State<AppState>) -> Json<StatusResponse> {
         connected: shared.connected.load(Relaxed),
         server: shared.server_addr.clone(),
         uptime_secs: shared.started.elapsed().as_secs(),
+        min_port: shared.min_port.load(Relaxed),
+        max_port: shared.max_port.load(Relaxed),
         tunnels,
     })
 }
@@ -124,6 +130,20 @@ async fn add_tunnel(State(st): State<AppState>, Json(req): Json<AddRequest>) -> 
             return (StatusCode::BAD_REQUEST, "local must be HOST:PORT").into_response();
         }
     };
+    // Validate the requested public port against the server's advertised range.
+    if let Some(p) = req.remote_port.filter(|p| *p != 0) {
+        let (min, max) = (
+            st.shared.min_port.load(Relaxed),
+            st.shared.max_port.load(Relaxed),
+        );
+        if max != 0 && (p < min || p > max) {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("public port {p} is outside the server's allowed range {min}-{max}"),
+            )
+                .into_response();
+        }
+    }
     let tunnel = TunnelConfig {
         name: req.name.trim().to_string(),
         protocol: proto,

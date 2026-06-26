@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use porthole::config::{ClientFile, ClientSettings, ServerSettings, TunnelConfig};
-use porthole::protocol::Proto;
+use porthole::protocol::{self, ClientMessage, Proto, ServerMessage};
 use porthole::{client, server, tls};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -204,4 +204,77 @@ async fn client_reconnects_when_server_starts_late() {
     let mut buf = vec![0u8; msg.len()];
     conn.read_exact(&mut buf).await.unwrap();
     assert_eq!(buf, msg);
+}
+
+#[tokio::test]
+async fn out_of_range_register_is_rejected() {
+    install();
+    let (ingress, public) = (free_port(), free_port());
+    let (cert, key) = temp_paths("range");
+    // The allowed range is exactly [public, public].
+    let ss = server_settings(ingress, public, cert, key);
+    let (_acceptor, fingerprint) = tls::server_acceptor(&ss).expect("cert");
+    tokio::spawn(server::run(ss));
+
+    // A raw TLS client (not the full porthole client) so we can inspect the handshake.
+    let connector = tls::client_connector(&fingerprint).unwrap();
+    let stream = loop {
+        match TcpStream::connect(("127.0.0.1", ingress)).await {
+            Ok(s) => break s,
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    };
+    let tls = connector
+        .connect(tls::pinned_server_name(), stream)
+        .await
+        .unwrap();
+    let mut wire = protocol::wire(tls);
+
+    protocol::send_msg(
+        &mut wire,
+        &ClientMessage::Hello {
+            token: "test-secret".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    // The server advertises its allowed range first.
+    let welcome: ServerMessage = protocol::recv_msg_timeout(&mut wire, Duration::from_secs(5))
+        .await
+        .unwrap();
+    match welcome {
+        ServerMessage::Welcome { min_port, max_port } => {
+            assert_eq!((min_port, max_port), (public, public));
+        }
+        other => panic!("expected Welcome, got {other:?}"),
+    }
+
+    // Request a port that is out of range and expect a tunnel-scoped rejection.
+    let bad = if public == u16::MAX {
+        public - 1
+    } else {
+        public + 1
+    };
+    protocol::send_msg(
+        &mut wire,
+        &ClientMessage::Register {
+            name: "x".into(),
+            proto: Proto::Tcp,
+            remote_port: Some(bad),
+        },
+    )
+    .await
+    .unwrap();
+
+    let reply: ServerMessage = protocol::recv_msg_timeout(&mut wire, Duration::from_secs(5))
+        .await
+        .unwrap();
+    match reply {
+        ServerMessage::Rejected { name, reason } => {
+            assert_eq!(name, "x");
+            assert!(reason.contains("range"), "reason was: {reason}");
+        }
+        other => panic!("expected Rejected, got {other:?}"),
+    }
 }

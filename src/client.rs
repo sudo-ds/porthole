@@ -3,7 +3,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::config::{save_client_file, ClientFile, ClientSettings, TunnelConfig};
 use crate::protocol::{
     self, ClientMessage, Proto, ServerMessage, Wire, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT,
+    NETWORK_TIMEOUT,
 };
 use crate::{net, tcp, tls, udp, web};
 
@@ -45,6 +46,8 @@ pub struct TunnelStatus {
     pub enabled: AtomicBool,
     pub public_addr: Mutex<Option<String>>,
     pub up: AtomicBool,
+    /// Last rejection reason from the server, if any (shown in the web UI).
+    pub error: Mutex<Option<String>>,
     pub counters: Arc<Counters>,
 }
 
@@ -60,6 +63,9 @@ pub struct ClientShared {
     pub out: Mutex<Option<mpsc::Sender<ClientMessage>>>,
     pub status: DashMap<String, TunnelStatus>,
     pub connected: AtomicBool,
+    /// Allowed public-port range advertised by the server (0 = not yet known).
+    pub min_port: AtomicU16,
+    pub max_port: AtomicU16,
     pub started: Instant,
     pub shutdown: CancellationToken,
 }
@@ -93,6 +99,8 @@ pub async fn run(settings: ClientSettings) -> Result<()> {
         out: Mutex::new(None),
         status,
         connected: AtomicBool::new(false),
+        min_port: AtomicU16::new(0),
+        max_port: AtomicU16::new(0),
         started: Instant::now(),
         shutdown: CancellationToken::new(),
     });
@@ -131,6 +139,7 @@ fn status_from(t: &TunnelConfig) -> TunnelStatus {
         enabled: AtomicBool::new(t.enabled),
         public_addr: Mutex::new(None),
         up: AtomicBool::new(false),
+        error: Mutex::new(None),
         counters: Arc::new(Counters::default()),
     }
 }
@@ -201,8 +210,21 @@ async fn connect_and_run(shared: &Arc<ClientShared>) -> Result<()> {
         },
     )
     .await?;
+
+    // The server replies with Welcome (the allowed port range) or an Error if auth fails.
+    let welcome: ServerMessage = protocol::recv_msg_timeout(&mut wire, NETWORK_TIMEOUT).await?;
+    match welcome {
+        ServerMessage::Welcome { min_port, max_port } => {
+            shared.min_port.store(min_port, Relaxed);
+            shared.max_port.store(max_port, Relaxed);
+            tracing::info!("connected (server allows public ports {min_port}-{max_port})");
+        }
+        ServerMessage::Error { message, .. } => {
+            return Err(anyhow!("server refused the connection: {message}"));
+        }
+        other => return Err(anyhow!("unexpected handshake reply: {other:?}")),
+    }
     shared.connected.store(true, Relaxed);
-    tracing::info!("connected");
 
     let conn_cancel = shared.shutdown.child_token();
     let (sink, mut stream) = wire.split();
@@ -272,6 +294,14 @@ async fn connect_and_run(shared: &Arc<ClientShared>) -> Result<()> {
                         conn_cancel.clone(),
                     ));
                 }
+                Ok(ServerMessage::Rejected { name, reason }) => {
+                    tracing::warn!("tunnel '{name}' rejected: {reason}");
+                    if let Some(s) = shared.status.get(&name) {
+                        *s.error.lock().unwrap() = Some(reason);
+                        s.up.store(false, Relaxed);
+                    }
+                }
+                Ok(ServerMessage::Welcome { .. }) => {}
                 Ok(ServerMessage::Heartbeat) => {}
                 Ok(ServerMessage::Error { message, fatal }) => {
                     tracing::warn!("server: {message}");
@@ -299,6 +329,7 @@ fn apply_accepted(
     let public = format!("{}:{}", host_of(&shared.server_addr), remote_port);
     if let Some(s) = shared.status.get(&name) {
         *s.public_addr.lock().unwrap() = Some(public.clone());
+        *s.error.lock().unwrap() = None;
         s.up.store(true, Relaxed);
     }
     tracing::info!("tunnel '{name}' ({proto}) is live at {public}");
