@@ -31,6 +31,7 @@ max_files = 14      # 0 disables pruning
 # Each tunnel exposes a local service on a public port of the server.
 # remote_port is optional (omit or 0 => the server assigns one).
 # encrypted defaults to false for the data channel. Set true to wrap data in TLS.
+# UDP tunnels can set udp_mtu (default 1200, range 256-65507) for plaintext fragmentation.
 [[tunnels]]
 name = "minecraft"
 protocol = "tcp"
@@ -47,3 +48,4 @@ local_addr = "127.0.0.1:2456"
 remote_port = 2456
 enabled = true
 encrypted = false
+udp_mtu = 1200

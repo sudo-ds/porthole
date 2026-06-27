@@ -365,6 +365,7 @@ async fn tcp_tunnel_roundtrip() {
         remote_port: Some(public),
         enabled: true,
         encrypted: false,
+        udp_mtu: None,
         proxy_protocol: ProxyProtocol::Off,
     };
     start_relay(ingress, public, "tcp", tunnel);
@@ -397,6 +398,7 @@ async fn tcp_tunnel_encrypted_roundtrip() {
         remote_port: Some(public),
         enabled: true,
         encrypted: true,
+        udp_mtu: None,
         proxy_protocol: ProxyProtocol::Off,
     };
     start_relay(ingress, public, "tcp-encrypted", tunnel);
@@ -422,6 +424,7 @@ async fn tcp_tunnel_proxy_protocol_v1_forwards_source_metadata() {
         remote_port: Some(public),
         enabled: true,
         encrypted: false,
+        udp_mtu: None,
         proxy_protocol: ProxyProtocol::V1,
     };
     start_relay(ingress, public, "proxy-v1", tunnel);
@@ -448,6 +451,7 @@ async fn tcp_tunnel_proxy_protocol_v2_forwards_source_metadata() {
         remote_port: Some(public),
         enabled: true,
         encrypted: false,
+        udp_mtu: None,
         proxy_protocol: ProxyProtocol::V2,
     };
     start_relay(ingress, public, "proxy-v2", tunnel);
@@ -479,6 +483,7 @@ async fn paused_client_does_not_register_enabled_tunnels() {
         remote_port: Some(public),
         enabled: true,
         encrypted: false,
+        udp_mtu: None,
         proxy_protocol: ProxyProtocol::Off,
     };
     tokio::spawn(client::run(client_settings_with(
@@ -530,6 +535,7 @@ async fn web_pause_persists_drops_active_tcp_and_unpause_restores_enabled_only()
         remote_port: Some(enabled_port),
         enabled: true,
         encrypted: false,
+        udp_mtu: None,
         proxy_protocol: ProxyProtocol::Off,
     };
     let disabled = TunnelConfig {
@@ -539,6 +545,7 @@ async fn web_pause_persists_drops_active_tcp_and_unpause_restores_enabled_only()
         remote_port: Some(disabled_port),
         enabled: false,
         encrypted: false,
+        udp_mtu: None,
         proxy_protocol: ProxyProtocol::Off,
     };
     let config_path = temp_client_config("web-pause");
@@ -594,6 +601,7 @@ async fn udp_tunnel_roundtrip() {
         remote_port: Some(public),
         enabled: true,
         encrypted: false,
+        udp_mtu: None,
         proxy_protocol: ProxyProtocol::Off,
     };
     start_relay(ingress, public, "udp", tunnel);
@@ -630,6 +638,7 @@ async fn udp_plaintext_large_safe_datagram_roundtrip() {
         remote_port: Some(public),
         enabled: true,
         encrypted: false,
+        udp_mtu: None,
         proxy_protocol: ProxyProtocol::Off,
     };
     start_relay(ingress, public, "udp-plain-large-safe", tunnel);
@@ -654,6 +663,42 @@ async fn udp_plaintext_large_safe_datagram_roundtrip() {
 
 #[tokio::test]
 #[ignore = "uses real loopback sockets; run explicitly for relay smoke testing"]
+async fn udp_plaintext_fragmented_datagram_roundtrip() {
+    install();
+    let echo = udp_echo().await;
+    let (ingress, public) = (free_port(), free_port());
+    let tunnel = TunnelConfig {
+        name: "u".into(),
+        protocol: Proto::Udp,
+        local_addr: echo,
+        remote_port: Some(public),
+        enabled: true,
+        encrypted: false,
+        udp_mtu: Some(512),
+        proxy_protocol: ProxyProtocol::Off,
+    };
+    start_relay(ingress, public, "udp-plain-fragmented", tunnel);
+
+    let public_addr: SocketAddr = format!("127.0.0.1:{public}").parse().unwrap();
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let payload = vec![0xEFu8; 4_000];
+    let mut buf = vec![0u8; 8_000];
+    let mut got: Option<Vec<u8>> = None;
+    for _ in 0..100 {
+        let _ = sock.send_to(&payload, public_addr).await;
+        match tokio::time::timeout(Duration::from_millis(300), sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) => {
+                got = Some(buf[..n].to_vec());
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    assert_eq!(got.as_deref(), Some(payload.as_slice()));
+}
+
+#[tokio::test]
+#[ignore = "uses real loopback sockets; run explicitly for relay smoke testing"]
 async fn udp_encrypted_large_datagram_roundtrip() {
     install();
     let echo = udp_echo().await;
@@ -665,6 +710,7 @@ async fn udp_encrypted_large_datagram_roundtrip() {
         remote_port: Some(public),
         enabled: true,
         encrypted: true,
+        udp_mtu: None,
         proxy_protocol: ProxyProtocol::Off,
     };
     start_relay(ingress, public, "udp-large", tunnel);
@@ -695,14 +741,21 @@ async fn udp_encrypted_large_datagram_roundtrip() {
 async fn web_add_tunnel_preserves_encryption_choices() {
     install();
     let echo = tcp_echo().await;
-    let (ingress, p1, p2, web) = (free_port(), free_port(), free_port(), free_port());
+    let udp_local = udp_echo().await;
+    let (ingress, p1, p2, p3, web) = (
+        free_port(),
+        free_port(),
+        free_port(),
+        free_port(),
+        free_port(),
+    );
     let (cert, key) = temp_paths("web-encryption");
     let ss = ServerSettings {
         bind_addr: "127.0.0.1".into(),
         control_port: ingress,
         secret: "test-secret".into(),
-        min_port: p1.min(p2),
-        max_port: p1.max(p2),
+        min_port: p1.min(p2).min(p3),
+        max_port: p1.max(p2).max(p3),
         cert_path: cert,
         key_path: key,
         public_host: None,
@@ -749,6 +802,21 @@ async fn web_add_tunnel_preserves_encryption_choices() {
     .await;
     assert!(r2.starts_with("HTTP/1.1 200"), "response was: {r2}");
 
+    let r3 = post_json(
+        web_addr,
+        "/api/tunnels",
+        serde_json::json!({
+            "name": "udp-mtu",
+            "proto": "udp",
+            "local": udp_local.to_string(),
+            "remote_port": p3,
+            "encrypted": false,
+            "udp_mtu": 900
+        }),
+    )
+    .await;
+    assert!(r3.starts_with("HTTP/1.1 200"), "response was: {r3}");
+
     wait_for_status(web_addr, |st| {
         let Some(tunnels) = st["tunnels"].as_array() else {
             return false;
@@ -759,7 +827,12 @@ async fn web_add_tunnel_preserves_encryption_choices() {
         let plain = tunnels
             .iter()
             .any(|t| t["name"] == "plain" && t["encrypted"].as_bool() == Some(false));
-        tls && plain
+        let udp_mtu = tunnels.iter().any(|t| {
+            t["name"] == "udp-mtu"
+                && t["encrypted"].as_bool() == Some(false)
+                && t["udp_mtu"].as_u64() == Some(900)
+        });
+        tls && plain && udp_mtu
     })
     .await;
 }
@@ -783,6 +856,7 @@ async fn client_reconnects_when_server_starts_late() {
         remote_port: Some(public),
         enabled: true,
         encrypted: false,
+        udp_mtu: None,
         proxy_protocol: ProxyProtocol::Off,
     };
     tokio::spawn(client::run(client_settings(ingress, fingerprint, tunnel)));
@@ -858,6 +932,7 @@ async fn out_of_range_register_is_rejected() {
             proto: Proto::Tcp,
             remote_port: Some(bad),
             encrypted: false,
+            udp_mtu: None,
         },
     )
     .await

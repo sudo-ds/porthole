@@ -48,6 +48,7 @@ pub struct TunnelStatus {
     pub local_addr: SocketAddr,
     pub remote_port: Option<u16>,
     pub encrypted: bool,
+    pub udp_mtu: Option<u16>,
     pub proxy_protocol: ProxyProtocol,
     pub enabled: AtomicBool,
     pub public_addr: Mutex<Option<String>>,
@@ -272,6 +273,7 @@ fn status_from(t: &TunnelConfig) -> TunnelStatus {
         local_addr: t.local_addr,
         remote_port: t.remote_port,
         encrypted: t.encrypted,
+        udp_mtu: config::resolved_udp_mtu(t.protocol, t.udp_mtu),
         proxy_protocol: t.proxy_protocol,
         enabled: AtomicBool::new(t.enabled),
         public_addr: Mutex::new(None),
@@ -288,6 +290,7 @@ fn ensure_status(shared: &ClientShared, t: &TunnelConfig) {
             s.local_addr = t.local_addr;
             s.remote_port = t.remote_port;
             s.encrypted = t.encrypted;
+            s.udp_mtu = config::resolved_udp_mtu(t.protocol, t.udp_mtu);
             s.proxy_protocol = t.proxy_protocol;
             s.enabled.store(t.enabled, Relaxed);
         }
@@ -419,6 +422,7 @@ async fn connect_and_run(shared: &Arc<ClientShared>) -> Result<()> {
                 proto: t.protocol,
                 remote_port: t.remote_port,
                 encrypted: t.encrypted,
+                udp_mtu: t.udp_mtu,
             })
             .await;
     }
@@ -487,6 +491,7 @@ fn apply_accepted(shared: &Arc<ClientShared>, conn_cancel: &CancellationToken, m
         encrypted,
         token,
         udp_auth_key,
+        udp_mtu,
         ..
     } = msg
     else {
@@ -540,8 +545,11 @@ fn apply_accepted(shared: &Arc<ClientShared>, conn_cancel: &CancellationToken, m
                     name,
                     local,
                     server_udp,
-                    token,
-                    key,
+                    udp::PlainUdpSettings {
+                        token,
+                        key,
+                        udp_mtu: udp_mtu.unwrap_or(protocol::DEFAULT_UDP_MTU),
+                    },
                     counters,
                     conn_cancel.clone(),
                 ));
@@ -713,6 +721,7 @@ async fn register_tunnel(shared: &Arc<ClientShared>, t: &TunnelConfig) {
             proto: t.protocol,
             remote_port: t.remote_port,
             encrypted: t.encrypted,
+            udp_mtu: t.udp_mtu,
         },
     )
     .await;
@@ -847,6 +856,7 @@ mod tests {
             remote_port: Some(25565),
             enabled: true,
             encrypted: false,
+            udp_mtu: None,
             proxy_protocol: ProxyProtocol::Off,
         };
         let existing = ClientFile {
@@ -918,6 +928,7 @@ mod tests {
             remote_port: Some(25565),
             enabled: true,
             encrypted: false,
+            udp_mtu: None,
             proxy_protocol: ProxyProtocol::Off,
         };
         let disabled = TunnelConfig {
@@ -927,6 +938,7 @@ mod tests {
             remote_port: Some(25566),
             enabled: false,
             encrypted: false,
+            udp_mtu: None,
             proxy_protocol: ProxyProtocol::Off,
         };
         let file = ClientFile {
@@ -965,7 +977,8 @@ mod tests {
                 name: "enabled".into(),
                 proto: Proto::Tcp,
                 remote_port: Some(25565),
-                encrypted: false
+                encrypted: false,
+                udp_mtu: None
             }
         );
         assert!(out_rx.try_recv().is_err());

@@ -331,8 +331,9 @@ impl Server {
                         proto,
                         remote_port,
                         encrypted,
+                        udp_mtu,
                     }) => {
-                        self.register(&mut session, name, proto, remote_port, encrypted)
+                        self.register(&mut session, name, proto, remote_port, encrypted, udp_mtu)
                             .await;
                     }
                     Ok(ClientMessage::Unregister { name }) => self.unregister(&mut session, &name),
@@ -358,8 +359,19 @@ impl Server {
         proto: Proto,
         remote_port: Option<u16>,
         encrypted: bool,
+        udp_mtu: Option<u16>,
     ) {
         let tx = session.control_tx.clone();
+        if let Err(e) = config::validate_udp_mtu(proto, udp_mtu) {
+            let _ = tx
+                .send(ServerMessage::Rejected {
+                    name,
+                    reason: e.to_string(),
+                })
+                .await;
+            return;
+        }
+        let resolved_udp_mtu = config::resolved_udp_mtu(proto, udp_mtu);
 
         let candidates: Vec<u16> = match remote_port {
             Some(p) => {
@@ -426,6 +438,7 @@ impl Server {
                                 encrypted,
                                 token: None,
                                 udp_auth_key: None,
+                                udp_mtu: None,
                             })
                             .await;
                         return;
@@ -458,6 +471,7 @@ impl Server {
                                 socket.clone(),
                                 token,
                                 key,
+                                resolved_udp_mtu.unwrap_or(protocol::DEFAULT_UDP_MTU),
                                 cancel,
                             ));
                             Some(protocol::encode_udp_auth_key(&key))
@@ -476,6 +490,7 @@ impl Server {
                                 encrypted,
                                 token: Some(token),
                                 udp_auth_key,
+                                udp_mtu: resolved_udp_mtu,
                             })
                             .await;
                         return;

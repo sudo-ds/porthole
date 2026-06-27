@@ -1,8 +1,9 @@
 //! Wire protocol shared by client and server.
 //!
-//! Every connection is a TLS stream carrying length-delimited frames (4-byte big-endian
+//! Control and encrypted data connections use length-delimited frames (4-byte big-endian
 //! length prefix). Control frames are JSON-encoded [`ClientMessage`]/[`ServerMessage`];
-//! UDP data frames are the compact binary encoding produced by [`encode_udp`].
+//! UDP data frames are the compact binary encoding produced by [`encode_udp`]. Plaintext
+//! UDP data channels use authenticated `PTHU` packets with optional fragmentation.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
@@ -39,10 +40,16 @@ pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
 pub const ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const UDP_PLAINTEXT_KEEPALIVE: Duration = Duration::from_secs(5);
-/// Keep native UDP relay packets below the IPv6 minimum MTU without fragmentation.
-pub const UDP_PLAINTEXT_MAX_PACKET: usize = 1200;
+/// Default native UDP relay packet size, excluding outer IP/UDP headers.
+pub const DEFAULT_UDP_MTU: u16 = 1200;
+pub const MIN_UDP_MTU: u16 = 256;
+/// Maximum UDP payload size for an IPv4 datagram.
+pub const MAX_UDP_MTU: u16 = 65_507;
+pub const UDP_PLAINTEXT_MAX_PACKET: usize = MAX_UDP_MTU as usize;
 pub const UDP_PLAINTEXT_OVERHEAD: usize = 4 + 1 + 1 + 8 + 16;
 pub const UDP_PLAINTEXT_MAX_BODY: usize = UDP_PLAINTEXT_MAX_PACKET - UDP_PLAINTEXT_OVERHEAD;
+pub const UDP_PLAINTEXT_FRAGMENT_HEADER: usize = 8 + 2 + 2 + 4;
+pub const UDP_PLAINTEXT_MAX_ENCAPSULATED: usize = 65_535 + 19;
 
 // ---------------------------------------------------------------------------
 // Protocol type
@@ -102,6 +109,8 @@ pub enum ClientMessage {
         remote_port: Option<u16>,
         #[serde(default)]
         encrypted: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        udp_mtu: Option<u16>,
     },
     /// Remove a previously registered tunnel.
     Unregister {
@@ -129,6 +138,8 @@ pub enum ServerMessage {
         token: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         udp_auth_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        udp_mtu: Option<u16>,
     },
     /// A registration was refused (port out of range, already in use, ...).
     Rejected {
@@ -276,6 +287,7 @@ pub enum PlainUdpKind {
     Hello,
     Data,
     Keepalive,
+    Fragment,
 }
 
 impl PlainUdpKind {
@@ -284,6 +296,7 @@ impl PlainUdpKind {
             Self::Hello => 1,
             Self::Data => 2,
             Self::Keepalive => 3,
+            Self::Fragment => 4,
         }
     }
 
@@ -292,9 +305,19 @@ impl PlainUdpKind {
             1 => Ok(Self::Hello),
             2 => Ok(Self::Data),
             3 => Ok(Self::Keepalive),
+            4 => Ok(Self::Fragment),
             other => bail!("invalid plaintext udp packet kind {other}"),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlainUdpFragment<'a> {
+    pub fragment_id: u64,
+    pub fragment_index: u16,
+    pub fragment_count: u16,
+    pub total_len: u32,
+    pub chunk: &'a [u8],
 }
 
 pub fn encode_udp_auth_key(key: &[u8; 32]) -> String {
@@ -309,6 +332,67 @@ pub fn decode_udp_auth_key(s: &str) -> Result<[u8; 32]> {
     let mut key = [0u8; 32];
     key.copy_from_slice(&bytes);
     Ok(key)
+}
+
+pub fn encode_udp_fragment_body(
+    fragment_id: u64,
+    fragment_index: u16,
+    fragment_count: u16,
+    total_len: u32,
+    chunk: &[u8],
+) -> Option<Bytes> {
+    if fragment_count == 0 || fragment_index >= fragment_count || total_len == 0 || chunk.is_empty()
+    {
+        return None;
+    }
+    if total_len as usize > UDP_PLAINTEXT_MAX_ENCAPSULATED {
+        return None;
+    }
+    let mut out = BytesMut::with_capacity(UDP_PLAINTEXT_FRAGMENT_HEADER + chunk.len());
+    out.put_u64(fragment_id);
+    out.put_u16(fragment_index);
+    out.put_u16(fragment_count);
+    out.put_u32(total_len);
+    out.put_slice(chunk);
+    Some(out.freeze())
+}
+
+pub fn decode_udp_fragment_body(body: &[u8]) -> Result<PlainUdpFragment<'_>> {
+    ensure!(
+        body.len() > UDP_PLAINTEXT_FRAGMENT_HEADER,
+        "short plaintext udp fragment"
+    );
+    let fragment_id = u64::from_be_bytes(body[0..8].try_into().unwrap());
+    let fragment_index = u16::from_be_bytes(body[8..10].try_into().unwrap());
+    let fragment_count = u16::from_be_bytes(body[10..12].try_into().unwrap());
+    let total_len = u32::from_be_bytes(body[12..16].try_into().unwrap());
+    let chunk = &body[UDP_PLAINTEXT_FRAGMENT_HEADER..];
+    ensure!(fragment_count > 0, "zero plaintext udp fragment count");
+    ensure!(
+        fragment_index < fragment_count,
+        "plaintext udp fragment index out of range"
+    );
+    ensure!(total_len > 0, "zero plaintext udp fragment total length");
+    ensure!(
+        total_len as usize <= UDP_PLAINTEXT_MAX_ENCAPSULATED,
+        "plaintext udp fragment total length is too large"
+    );
+    ensure!(!chunk.is_empty(), "empty plaintext udp fragment chunk");
+    ensure!(
+        fragment_count as usize <= total_len as usize,
+        "plaintext udp fragment count exceeds total length"
+    );
+    ensure!(
+        chunk.len() <= total_len as usize,
+        "plaintext udp fragment chunk exceeds total length"
+    );
+    Ok(PlainUdpFragment {
+        fragment_id,
+        fragment_index,
+        fragment_count,
+        total_len,
+        chunk,
+    })
 }
 
 pub fn encode_plain_udp(
@@ -500,6 +584,27 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_udp_fragment_body_roundtrip_and_rejects_bad_metadata() {
+        let body = encode_udp_fragment_body(99, 1, 3, 12, b"abcd").unwrap();
+        let got = decode_udp_fragment_body(&body).unwrap();
+        assert_eq!(got.fragment_id, 99);
+        assert_eq!(got.fragment_index, 1);
+        assert_eq!(got.fragment_count, 3);
+        assert_eq!(got.total_len, 12);
+        assert_eq!(got.chunk, b"abcd");
+
+        assert!(encode_udp_fragment_body(1, 0, 0, 4, b"x").is_none());
+        assert!(encode_udp_fragment_body(1, 2, 2, 4, b"x").is_none());
+        assert!(encode_udp_fragment_body(1, 0, 1, 0, b"x").is_none());
+        assert!(encode_udp_fragment_body(1, 0, 1, 4, b"").is_none());
+
+        let short = [0u8; UDP_PLAINTEXT_FRAGMENT_HEADER];
+        assert!(decode_udp_fragment_body(&short).is_err());
+        let bad_count = encode_udp_fragment_body(1, 0, 5, 4, b"x").unwrap();
+        assert!(decode_udp_fragment_body(&bad_count).is_err());
+    }
+
+    #[test]
     fn udp_auth_key_roundtrip() {
         let key = [3u8; 32];
         let text = encode_udp_auth_key(&key);
@@ -523,12 +628,14 @@ mod tests {
                 proto: Proto::Tcp,
                 remote_port: Some(25565),
                 encrypted: false,
+                udp_mtu: None,
             },
             ClientMessage::Register {
                 name: "g".into(),
                 proto: Proto::Udp,
                 remote_port: None,
                 encrypted: false,
+                udp_mtu: Some(DEFAULT_UDP_MTU),
             },
             ClientMessage::Unregister { name: "mc".into() },
             ClientMessage::Heartbeat,
@@ -547,6 +654,7 @@ mod tests {
             encrypted: false,
             token: Some(Uuid::nil()),
             udp_auth_key: None,
+            udp_mtu: Some(DEFAULT_UDP_MTU),
         };
         let j = serde_json::to_vec(&s).unwrap();
         let back: ServerMessage = serde_json::from_slice(&j).unwrap();

@@ -7,7 +7,9 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{ClientArgs, ServerArgs};
-use crate::protocol::{Proto, DEFAULT_CONTROL_PORT, DEFAULT_WEB_BIND};
+use crate::protocol::{
+    Proto, DEFAULT_CONTROL_PORT, DEFAULT_UDP_MTU, DEFAULT_WEB_BIND, MAX_UDP_MTU, MIN_UDP_MTU,
+};
 
 pub const ENV_SECRET: &str = "PORTHOLE_SECRET";
 
@@ -87,6 +89,8 @@ pub struct TunnelConfig {
     pub enabled: bool,
     #[serde(default)]
     pub encrypted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_mtu: Option<u16>,
     #[serde(default, skip_serializing_if = "ProxyProtocol::is_off")]
     pub proxy_protocol: ProxyProtocol,
 }
@@ -136,10 +140,27 @@ pub fn validate_tunnel_config(t: &TunnelConfig) -> Result<()> {
     if t.protocol == Proto::Udp && !t.proxy_protocol.is_off() {
         bail!("proxy_protocol is only supported for tcp tunnels");
     }
+    validate_udp_mtu(t.protocol, t.udp_mtu)?;
     Ok(())
 }
 
-/// Parse a `name=proto:LOCAL->REMOTE[;proxy=v1|v2][;encrypted=true|false]` CLI spec.
+pub fn validate_udp_mtu(proto: Proto, udp_mtu: Option<u16>) -> Result<()> {
+    if proto == Proto::Tcp && udp_mtu.is_some() {
+        bail!("udp_mtu is only supported for udp tunnels");
+    }
+    if let Some(mtu) = udp_mtu {
+        if !(MIN_UDP_MTU..=MAX_UDP_MTU).contains(&mtu) {
+            bail!("udp_mtu must be between {MIN_UDP_MTU} and {MAX_UDP_MTU}");
+        }
+    }
+    Ok(())
+}
+
+pub fn resolved_udp_mtu(proto: Proto, udp_mtu: Option<u16>) -> Option<u16> {
+    (proto == Proto::Udp).then_some(udp_mtu.unwrap_or(DEFAULT_UDP_MTU))
+}
+
+/// Parse a `name=proto:LOCAL->REMOTE[;proxy=v1|v2][;encrypted=true|false][;udp_mtu=N]` CLI spec.
 pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelConfig> {
     let (name, rest) = spec
         .split_once('=')
@@ -156,6 +177,7 @@ pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelConfig> {
     let mut proxy_set = false;
     let mut encrypted = false;
     let mut encrypted_set = false;
+    let mut udp_mtu = None;
     for opt in remote_parts {
         let opt = opt.trim();
         if opt.is_empty() {
@@ -179,6 +201,15 @@ pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelConfig> {
                 encrypted = parse_bool_option(value)?;
                 encrypted_set = true;
             }
+            "udp_mtu" | "mtu" => {
+                if udp_mtu.is_some() {
+                    bail!("duplicate udp_mtu option in {spec:?}");
+                }
+                udp_mtu =
+                    Some(value.trim().parse().with_context(|| {
+                        format!("invalid udp_mtu option {value:?} in {spec:?}")
+                    })?);
+            }
             other => bail!("unknown tunnel option {other:?} in {spec:?}"),
         }
     }
@@ -198,6 +229,7 @@ pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelConfig> {
         remote_port: (remote_port != 0).then_some(remote_port),
         enabled: true,
         encrypted,
+        udp_mtu,
         proxy_protocol,
     };
     validate_tunnel_config(&t)?;
@@ -498,6 +530,7 @@ mod tests {
         assert_eq!(t.remote_port, Some(25565));
         assert!(t.enabled);
         assert!(!t.encrypted);
+        assert_eq!(t.udp_mtu, None);
         assert_eq!(t.proxy_protocol, ProxyProtocol::Off);
     }
 
@@ -507,6 +540,10 @@ mod tests {
         assert_eq!(t.protocol, Proto::Udp);
         assert_eq!(t.remote_port, None);
         assert!(!t.encrypted);
+        assert_eq!(
+            resolved_udp_mtu(t.protocol, t.udp_mtu),
+            Some(DEFAULT_UDP_MTU)
+        );
         assert_eq!(t.proxy_protocol, ProxyProtocol::Off);
     }
 
@@ -526,6 +563,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_spec_accepts_udp_mtu_suffix_aliases() {
+        let t = parse_tunnel_spec("g=udp:127.0.0.1:19132->0;udp_mtu=900").unwrap();
+        assert_eq!(t.udp_mtu, Some(900));
+        assert_eq!(resolved_udp_mtu(t.protocol, t.udp_mtu), Some(900));
+
+        let t = parse_tunnel_spec("g=udp:127.0.0.1:19132->0;mtu=1400").unwrap();
+        assert_eq!(t.udp_mtu, Some(1400));
+    }
+
+    #[test]
     fn parse_spec_rejects_garbage() {
         assert!(parse_tunnel_spec("nope").is_err());
         assert!(parse_tunnel_spec("a=tcp:badaddr->1").is_err());
@@ -533,6 +580,9 @@ mod tests {
         assert!(parse_tunnel_spec("a=tcp:127.0.0.1:1->2;banana=v1").is_err());
         assert!(parse_tunnel_spec("a=tcp:127.0.0.1:1->2;encrypted=maybe").is_err());
         assert!(parse_tunnel_spec("a=udp:127.0.0.1:1->2;proxy=v1").is_err());
+        assert!(parse_tunnel_spec("a=tcp:127.0.0.1:1->2;udp_mtu=1200").is_err());
+        assert!(parse_tunnel_spec("a=udp:127.0.0.1:1->2;udp_mtu=255").is_err());
+        assert!(parse_tunnel_spec("a=udp:127.0.0.1:1->2;udp_mtu=65508").is_err());
     }
 
     #[test]
@@ -548,9 +598,11 @@ remote_port = 25565
         .unwrap();
         assert_eq!(t.proxy_protocol, ProxyProtocol::Off);
         assert!(!t.encrypted);
+        assert_eq!(t.udp_mtu, None);
 
         let text = toml::to_string(&t).unwrap();
         assert!(!text.contains("proxy_protocol"));
+        assert!(!text.contains("udp_mtu"));
     }
 
     #[test]
@@ -580,6 +632,38 @@ protocol = "udp"
 local_addr = "127.0.0.1:19132"
 remote_port = 19132
 proxy_protocol = "v1"
+"#,
+        )
+        .unwrap();
+        assert!(validate_tunnel_config(&t).is_err());
+    }
+
+    #[test]
+    fn tunnel_udp_mtu_serializes_when_present() {
+        let t: TunnelConfig = toml::from_str(
+            r#"
+name = "udp"
+protocol = "udp"
+local_addr = "127.0.0.1:19132"
+remote_port = 19132
+udp_mtu = 900
+"#,
+        )
+        .unwrap();
+        assert_eq!(t.udp_mtu, Some(900));
+        assert!(validate_tunnel_config(&t).is_ok());
+        assert!(toml::to_string(&t).unwrap().contains("udp_mtu = 900"));
+    }
+
+    #[test]
+    fn validate_rejects_tcp_udp_mtu() {
+        let t: TunnelConfig = toml::from_str(
+            r#"
+name = "tcp"
+protocol = "tcp"
+local_addr = "127.0.0.1:25565"
+remote_port = 25565
+udp_mtu = 1200
 "#,
         )
         .unwrap();

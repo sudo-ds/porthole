@@ -90,7 +90,9 @@ and relays public traffic back over data channels the client opened.
   fresh outbound data connection (paired by an unguessable id) and the server splices the two.
   TCP data channels are plaintext by default; set `encrypted = true` to wrap them in TLS.
 - **UDP** — plaintext UDP tunnels use a native authenticated UDP data channel for lower latency.
-  Set `encrypted = true` to use the compatibility path that multiplexes UDP over TLS/TCP.
+  Large plaintext datagrams are fragmented/reassembled between the relay and client according
+  to `udp_mtu` (default `1200`). Set `encrypted = true` to use the compatibility path that
+  multiplexes UDP over TLS/TCP.
 - **Security** — control traffic is always TLS. The server uses a self-signed certificate; its
   fingerprint travels inside the connection code, so the client pins it (no CA or domain needed).
   A shared token (also in the code) authenticates the client. Plain data channels are not
@@ -104,7 +106,7 @@ On an interactive terminal the client shows a live dashboard:
        .-"""""-.
      .'  o o o  '.        ... (purple logo) ...
        '-.....-'
-  client · v0.5.0
+  client · v0.5.1
 
   ● connected to 10xdev.sk:7835    public ports 1024-65535
 
@@ -194,9 +196,11 @@ PORTHOLE_SECRET=... porthole client \
   --tunnel mc=tcp:127.0.0.1:25565->25565
 ```
 
-`--tunnel` spec is `name=proto:LOCAL->REMOTE[;proxy=v1|v2][;encrypted=true|false]` (use
-REMOTE `0` for a server-assigned port). The `encrypted` key also accepts `encrypt` or `tls`
-as aliases.
+`--tunnel` spec is
+`name=proto:LOCAL->REMOTE[;proxy=v1|v2][;encrypted=true|false][;udp_mtu=N]` (use REMOTE `0`
+for a server-assigned port). The `encrypted` key also accepts `encrypt` or `tls` as aliases.
+For UDP tunnels, `udp_mtu` also accepts `mtu`; it defaults to `1200` and must be between
+`256` and `65507`.
 
 ### TCP source IP forwarding
 
@@ -230,6 +234,26 @@ drop the connection. Also make sure the upstream service only accepts PROXY prot
 trusted porthole client address, such as `127.0.0.1` or a private LAN IP; otherwise direct
 callers could spoof client IPs by sending their own PROXY header. UDP tunnels do not support
 this option.
+
+### UDP MTU and fragmentation
+
+Plaintext UDP tunnels (`encrypted = false`) use authenticated native UDP packets between the
+relay and client. If the encoded datagram is larger than `udp_mtu`, porthole fragments it into
+multiple authenticated relay packets and reassembles it on the other side. `udp_mtu` is the
+maximum porthole UDP packet payload sent on the socket, excluding outer IP/UDP headers.
+
+```toml
+[[tunnels]]
+name = "valheim"
+protocol = "udp"
+local_addr = "127.0.0.1:2456"
+remote_port = 2456
+encrypted = false
+udp_mtu = 1200      # default; valid range 256-65507
+```
+
+Encrypted UDP tunnels (`encrypted = true`) keep the compatibility path that multiplexes UDP
+over TLS/TCP, so `udp_mtu` is reported but not used by that data channel.
 
 ## Build
 
