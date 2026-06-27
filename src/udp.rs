@@ -4,8 +4,8 @@
 //! datagram with the end-user's address. The server keeps no per-flow state (the address
 //! tag is authoritative); the client keeps one ephemeral socket per end-user address.
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::client::{ClientShared, Counters};
+use crate::config::UdpSourcePool;
 use crate::protocol::{
     decode_plain_udp, decode_udp, decode_udp_fragment_body, encode_plain_udp, encode_udp,
     encode_udp_fragment_body, PlainUdpFragment, PlainUdpKind, Wire, UDP_IDLE_TIMEOUT,
@@ -232,6 +233,7 @@ pub async fn server_plain_forward(
 struct FlowEntry {
     sock: Arc<UdpSocket>,
     cancel: CancellationToken,
+    source_ip: Option<Ipv4Addr>,
     /// Milliseconds since the channel started; updated on each datagram in either direction
     /// (a lock-free store instead of a shared-map write on the per-packet path).
     last_seen: Arc<AtomicU64>,
@@ -247,6 +249,7 @@ pub async fn client_channel(
     shared: Arc<ClientShared>,
     tunnel: String,
     local: SocketAddr,
+    source_pool: Option<UdpSourcePool>,
     token: Uuid,
     counters: Arc<Counters>,
     cancel: CancellationToken,
@@ -257,7 +260,16 @@ pub async fn client_channel(
             break;
         }
         let started = Instant::now();
-        run_udp_channel(&shared, &tunnel, local, token, &counters, &cancel).await;
+        run_udp_channel(
+            &shared,
+            &tunnel,
+            local,
+            source_pool,
+            token,
+            &counters,
+            &cancel,
+        )
+        .await;
         if cancel.is_cancelled() {
             break;
         }
@@ -280,6 +292,7 @@ pub struct PlainUdpSettings {
     pub token: Uuid,
     pub key: [u8; 32],
     pub udp_mtu: u16,
+    pub source_pool: Option<UdpSourcePool>,
 }
 
 pub async fn client_plain_channel(
@@ -323,6 +336,7 @@ async fn run_udp_channel(
     shared: &Arc<ClientShared>,
     tunnel: &str,
     local: SocketAddr,
+    source_pool: Option<UdpSourcePool>,
     token: Uuid,
     counters: &Arc<Counters>,
     cancel: &CancellationToken,
@@ -411,7 +425,14 @@ async fn run_udp_channel(
                         if flows.len() >= MAX_FLOWS {
                             continue;
                         }
-                        let sock = match bind_local_flow(local).await {
+                        let source_ip = match select_pool_addr(src, source_pool, &flows) {
+                            Some(ip) => ip,
+                            None => {
+                                tracing::debug!("udp source pool exhausted for '{tunnel}'");
+                                continue;
+                            }
+                        };
+                        let sock = match bind_local_flow(local, source_ip).await {
                             Ok(s) => Arc::new(s),
                             Err(e) => { tracing::debug!("opening flow socket: {e}"); continue; }
                         };
@@ -422,6 +443,7 @@ async fn run_udp_channel(
                             FlowEntry {
                                 sock: sock.clone(),
                                 cancel: flow_cancel.clone(),
+                                source_ip,
                                 last_seen: last_seen.clone(),
                             },
                         );
@@ -577,7 +599,14 @@ async fn run_plain_udp_channel(
                         if flows.len() >= MAX_FLOWS {
                             continue;
                         }
-                        let sock = match bind_local_flow(local).await {
+                        let source_ip = match select_pool_addr(src, settings.source_pool, &flows) {
+                            Some(ip) => ip,
+                            None => {
+                                tracing::debug!("udp source pool exhausted for '{tunnel}'");
+                                continue;
+                            }
+                        };
+                        let sock = match bind_local_flow(local, source_ip).await {
                             Ok(s) => Arc::new(s),
                             Err(e) => { tracing::debug!("opening plaintext udp flow socket: {e}"); continue; }
                         };
@@ -588,6 +617,7 @@ async fn run_plain_udp_channel(
                             FlowEntry {
                                 sock: sock.clone(),
                                 cancel: flow_cancel.clone(),
+                                source_ip,
                                 last_seen: last_seen.clone(),
                             },
                         );
@@ -754,11 +784,72 @@ async fn connect_plain_udp_socket(server_udp: &str) -> Result<UdpSocket> {
     Ok(sock)
 }
 
-async fn bind_local_flow(local: SocketAddr) -> std::io::Result<UdpSocket> {
-    let bind: SocketAddr = if local.is_ipv4() {
-        "0.0.0.0:0".parse().unwrap()
-    } else {
-        "[::]:0".parse().unwrap()
+fn select_pool_addr(
+    src: SocketAddr,
+    source_pool: Option<UdpSourcePool>,
+    flows: &DashMap<SocketAddr, FlowEntry>,
+) -> Option<Option<Ipv4Addr>> {
+    let Some(pool) = source_pool else {
+        return Some(None);
+    };
+    let used: HashSet<Ipv4Addr> = flows.iter().filter_map(|e| e.value().source_ip).collect();
+    select_pool_addr_from_used(src, pool, &used).map(Some)
+}
+
+fn select_pool_addr_from_used(
+    src: SocketAddr,
+    pool: UdpSourcePool,
+    used: &HashSet<Ipv4Addr>,
+) -> Option<Ipv4Addr> {
+    let size = pool.size();
+    if used.len() as u32 >= size {
+        return None;
+    }
+    let start = (stable_socket_hash(src) % u64::from(size)) as u32;
+    for step in 0..size {
+        let index = (start + step) % size;
+        let ip = pool.addr_at(index)?;
+        if !used.contains(&ip) {
+            return Some(ip);
+        }
+    }
+    None
+}
+
+fn stable_socket_hash(addr: SocketAddr) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut push = |byte: u8| {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    };
+    match addr.ip() {
+        IpAddr::V4(ip) => {
+            push(4);
+            for byte in ip.octets() {
+                push(byte);
+            }
+        }
+        IpAddr::V6(ip) => {
+            push(6);
+            for byte in ip.octets() {
+                push(byte);
+            }
+        }
+    }
+    for byte in addr.port().to_be_bytes() {
+        push(byte);
+    }
+    hash
+}
+
+async fn bind_local_flow(
+    local: SocketAddr,
+    source_ip: Option<Ipv4Addr>,
+) -> std::io::Result<UdpSocket> {
+    let bind: SocketAddr = match source_ip {
+        Some(ip) => SocketAddr::new(IpAddr::V4(ip), 0),
+        None if local.is_ipv4() => "0.0.0.0:0".parse().unwrap(),
+        None => "[::]:0".parse().unwrap(),
     };
     let sock = UdpSocket::bind(bind).await?;
     sock.connect(local).await?;
@@ -991,6 +1082,35 @@ mod tests {
         }
 
         assert_eq!(complete.as_deref(), Some(body.as_ref()));
+    }
+
+    #[test]
+    fn udp_source_pool_assigns_distinct_ips_for_active_flows() {
+        let pool: UdpSourcePool = "127.64.0.0/30".parse().unwrap();
+        let first: SocketAddr = "198.51.100.10:40000".parse().unwrap();
+        let second: SocketAddr = "198.51.100.11:40000".parse().unwrap();
+        let mut used = HashSet::new();
+
+        let first_ip = select_pool_addr_from_used(first, pool, &used).unwrap();
+        used.insert(first_ip);
+        let second_ip = select_pool_addr_from_used(second, pool, &used).unwrap();
+
+        assert_ne!(first_ip, second_ip);
+        assert_eq!(first_ip.octets()[0], 127);
+        assert_eq!(
+            select_pool_addr_from_used(first, pool, &HashSet::new()),
+            Some(first_ip)
+        );
+    }
+
+    #[test]
+    fn udp_source_pool_exhaustion_fails_closed() {
+        let pool: UdpSourcePool = "127.64.0.9/32".parse().unwrap();
+        let peer: SocketAddr = "198.51.100.10:40000".parse().unwrap();
+        let mut used = HashSet::new();
+        used.insert("127.64.0.9".parse().unwrap());
+
+        assert_eq!(select_pool_addr_from_used(peer, pool, &used), None);
     }
 
     #[test]

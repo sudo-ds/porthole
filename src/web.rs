@@ -71,6 +71,7 @@ struct TunnelView {
     remote_port: Option<u16>,
     encrypted: bool,
     udp_mtu: Option<u16>,
+    udp_source_pool: Option<String>,
     proxy_protocol: String,
     public: Option<String>,
     enabled: bool,
@@ -95,6 +96,7 @@ async fn status(State(st): State<AppState>) -> Json<StatusResponse> {
                 remote_port: s.remote_port,
                 encrypted: s.encrypted,
                 udp_mtu: s.udp_mtu,
+                udp_source_pool: s.udp_source_pool.map(|p| p.to_string()),
                 proxy_protocol: s.proxy_protocol.to_string(),
                 public: s.public_addr.lock().unwrap().clone(),
                 enabled: s.enabled.load(Relaxed),
@@ -127,6 +129,7 @@ struct AddRequest {
     remote_port: Option<u16>,
     encrypted: Option<bool>,
     udp_mtu: Option<u16>,
+    udp_source_pool: Option<String>,
     proxy_protocol: Option<String>,
 }
 
@@ -156,6 +159,24 @@ async fn add_tunnel(State(st): State<AppState>, Json(req): Json<AddRequest>) -> 
                 .into_response();
         }
     };
+    let udp_source_pool = match req
+        .udp_source_pool
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(pool) => match pool.parse() {
+            Ok(pool) => Some(pool),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "udp_source_pool must be an IPv4 loopback CIDR such as 127.64.0.0/16",
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
     // Validate the requested public port against the server's advertised range.
     if let Some(p) = req.remote_port.filter(|p| *p != 0) {
         let (min, max) = (
@@ -178,6 +199,7 @@ async fn add_tunnel(State(st): State<AppState>, Json(req): Json<AddRequest>) -> 
         enabled: true,
         encrypted: req.encrypted.unwrap_or(false),
         udp_mtu: req.udp_mtu,
+        udp_source_pool,
         proxy_protocol,
     };
     if let Err(e) = config::validate_tunnel_config(&tunnel) {

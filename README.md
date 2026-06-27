@@ -200,8 +200,8 @@ PORTHOLE_SECRET=... porthole client \
 ```
 
 `--tunnel` spec is
-`name=proto:LOCAL->REMOTE[;proxy=v1|v2][;encrypted=true|false][;udp_mtu=N]` (use REMOTE `0`
-for a server-assigned port). The `encrypted` key also accepts `encrypt` or `tls` as aliases.
+`name=proto:LOCAL->REMOTE[;proxy=v1|v2][;encrypted=true|false][;udp_mtu=N][;udp_source_pool=CIDR]`
+(use REMOTE `0` for a server-assigned port). The `encrypted` key also accepts `encrypt` or `tls` as aliases.
 `proto` is `tcp`, `udp`, or `both`. For UDP-capable tunnels, `udp_mtu` also accepts `mtu`;
 it defaults to `1200` and must be between `256` and `65507`.
 
@@ -257,6 +257,32 @@ udp_mtu = 1200      # default; valid range 256-65507
 
 Encrypted UDP-capable tunnels (`encrypted = true`) keep the compatibility path that multiplexes
 UDP over TLS/TCP, so `udp_mtu` is reported but not used by that data channel.
+
+### Experimental UDP source address pooling
+
+For UDP game servers running on the same machine as the porthole client, an experimental
+loopback source pool can make different Internet peers appear as different local source IPs.
+This does not forward real client IPs; it assigns stable synthetic `127.x.x.x` addresses while
+each UDP flow is active.
+
+```toml
+[[tunnels]]
+name = "bedrock"
+protocol = "udp"
+local_addr = "127.0.0.1:19132"
+remote_port = 19132
+udp_source_pool = "127.64.0.0/16"
+```
+
+Or from the CLI:
+
+```sh
+porthole client ... --tunnel 'bedrock=udp:127.0.0.1:19132->19132;udp_source_pool=127.64.0.0/16'
+```
+
+`udp_source_pool` is client-only and requires a UDP-capable tunnel whose `local_addr` is IPv4
+loopback. Only IPv4 CIDRs inside `127.0.0.0/8` are accepted. If all pool addresses are in use,
+datagrams from new UDP peers are dropped until existing flows go idle.
 
 ## Build
 

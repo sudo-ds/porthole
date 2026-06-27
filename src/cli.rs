@@ -180,7 +180,7 @@ pub struct ClientArgs {
     /// File containing the shared secret.
     #[arg(long, value_name = "FILE")]
     pub secret_file: Option<PathBuf>,
-    /// Tunnel spec `name=proto:LOCAL->REMOTE[;proxy=v1|v2][;encrypted=true|false][;udp_mtu=N]` (repeatable),
+    /// Tunnel spec `name=proto:LOCAL->REMOTE[;proxy=v1|v2][;encrypted=true|false][;udp_mtu=N][;udp_source_pool=CIDR]` (repeatable),
     /// where proto is `tcp`, `udp`, or `both`.
     /// e.g. `mc=tcp:127.0.0.1:25565->25565`. Use REMOTE `0` for a server-assigned port.
     #[arg(long = "tunnel", value_name = "SPEC")]

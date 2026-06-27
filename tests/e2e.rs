@@ -1,6 +1,7 @@
 //! End-to-end tests: spin up a server + client in-process against localhost echo targets
 //! and push real bytes through the relay.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -10,7 +11,7 @@ use porthole::protocol::{self, ClientMessage, Proto, ServerMessage};
 use porthole::{client, server, tls};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 fn install() {
     let _ = porthole::install_crypto_provider();
@@ -189,6 +190,20 @@ async fn udp_echo() -> SocketAddr {
         }
     });
     addr
+}
+
+async fn udp_peer_report_echo() -> (SocketAddr, mpsc::Receiver<SocketAddr>) {
+    let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = s.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel(16);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 65535];
+        while let Ok((n, peer)) = s.recv_from(&mut buf).await {
+            let _ = tx.send(peer).await;
+            let _ = s.send_to(&buf[..n], peer).await;
+        }
+    });
+    (addr, rx)
 }
 
 async fn both_echo() -> SocketAddr {
@@ -416,6 +431,7 @@ async fn tcp_tunnel_roundtrip() {
         enabled: true,
         encrypted: false,
         udp_mtu: None,
+        udp_source_pool: None,
         proxy_protocol: ProxyProtocol::Off,
     };
     start_relay(ingress, public, "tcp", tunnel);
@@ -449,6 +465,7 @@ async fn tcp_tunnel_encrypted_roundtrip() {
         enabled: true,
         encrypted: true,
         udp_mtu: None,
+        udp_source_pool: None,
         proxy_protocol: ProxyProtocol::Off,
     };
     start_relay(ingress, public, "tcp-encrypted", tunnel);
@@ -475,6 +492,7 @@ async fn tcp_tunnel_proxy_protocol_v1_forwards_source_metadata() {
         enabled: true,
         encrypted: false,
         udp_mtu: None,
+        udp_source_pool: None,
         proxy_protocol: ProxyProtocol::V1,
     };
     start_relay(ingress, public, "proxy-v1", tunnel);
@@ -502,6 +520,7 @@ async fn tcp_tunnel_proxy_protocol_v2_forwards_source_metadata() {
         enabled: true,
         encrypted: false,
         udp_mtu: None,
+        udp_source_pool: None,
         proxy_protocol: ProxyProtocol::V2,
     };
     start_relay(ingress, public, "proxy-v2", tunnel);
@@ -534,6 +553,7 @@ async fn paused_client_does_not_register_enabled_tunnels() {
         enabled: true,
         encrypted: false,
         udp_mtu: None,
+        udp_source_pool: None,
         proxy_protocol: ProxyProtocol::Off,
     };
     tokio::spawn(client::run(client_settings_with(
@@ -586,6 +606,7 @@ async fn web_pause_persists_drops_active_tcp_and_unpause_restores_enabled_only()
         enabled: true,
         encrypted: false,
         udp_mtu: None,
+        udp_source_pool: None,
         proxy_protocol: ProxyProtocol::Off,
     };
     let disabled = TunnelConfig {
@@ -596,6 +617,7 @@ async fn web_pause_persists_drops_active_tcp_and_unpause_restores_enabled_only()
         enabled: false,
         encrypted: false,
         udp_mtu: None,
+        udp_source_pool: None,
         proxy_protocol: ProxyProtocol::Off,
     };
     let config_path = temp_client_config("web-pause");
@@ -652,6 +674,7 @@ async fn udp_tunnel_roundtrip() {
         enabled: true,
         encrypted: false,
         udp_mtu: None,
+        udp_source_pool: None,
         proxy_protocol: ProxyProtocol::Off,
     };
     start_relay(ingress, public, "udp", tunnel);
@@ -677,6 +700,82 @@ async fn udp_tunnel_roundtrip() {
 
 #[tokio::test]
 #[ignore = "uses real loopback sockets; run explicitly for relay smoke testing"]
+async fn udp_source_pool_presents_distinct_loopback_sources() {
+    install();
+    let (local, mut seen) = udp_peer_report_echo().await;
+    let (ingress, public) = (free_port(), free_port());
+    let tunnel = TunnelConfig {
+        name: "u".into(),
+        protocol: Proto::Udp,
+        local_addr: local,
+        remote_port: Some(public),
+        enabled: true,
+        encrypted: false,
+        udp_mtu: None,
+        udp_source_pool: Some("127.64.0.0/16".parse().unwrap()),
+        proxy_protocol: ProxyProtocol::Off,
+    };
+    start_relay(ingress, public, "udp-source-pool", tunnel);
+
+    let public_addr: SocketAddr = format!("127.0.0.1:{public}").parse().unwrap();
+    let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut buf = [0u8; 64];
+
+    let mut first_ok = false;
+    for _ in 0..100 {
+        let _ = first.send_to(b"one", public_addr).await;
+        if let Ok(Ok((n, _))) =
+            tokio::time::timeout(Duration::from_millis(150), first.recv_from(&mut buf)).await
+        {
+            first_ok = &buf[..n] == b"one";
+            if first_ok {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(first_ok, "first UDP source did not roundtrip");
+
+    let mut second_ok = false;
+    for _ in 0..100 {
+        let _ = second.send_to(b"two", public_addr).await;
+        if let Ok(Ok((n, _))) =
+            tokio::time::timeout(Duration::from_millis(150), second.recv_from(&mut buf)).await
+        {
+            second_ok = &buf[..n] == b"two";
+            if second_ok {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(second_ok, "second UDP source did not roundtrip");
+
+    let mut ips = HashSet::new();
+    for _ in 0..16 {
+        let peer = tokio::time::timeout(Duration::from_secs(1), seen.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        ips.insert(peer.ip());
+        if ips.len() >= 2 {
+            break;
+        }
+    }
+    assert_eq!(ips.len(), 2, "local service saw peers {ips:?}");
+    for ip in ips {
+        let octets = match ip {
+            std::net::IpAddr::V4(ip) => ip.octets(),
+            std::net::IpAddr::V6(ip) => panic!("unexpected IPv6 source {ip}"),
+        };
+        assert_eq!(octets[0], 127);
+        assert_eq!(octets[1], 64);
+    }
+}
+
+#[tokio::test]
+#[ignore = "uses real loopback sockets; run explicitly for relay smoke testing"]
 async fn udp_plaintext_large_safe_datagram_roundtrip() {
     install();
     let echo = udp_echo().await;
@@ -689,6 +788,7 @@ async fn udp_plaintext_large_safe_datagram_roundtrip() {
         enabled: true,
         encrypted: false,
         udp_mtu: None,
+        udp_source_pool: None,
         proxy_protocol: ProxyProtocol::Off,
     };
     start_relay(ingress, public, "udp-plain-large-safe", tunnel);
@@ -725,6 +825,7 @@ async fn udp_plaintext_fragmented_datagram_roundtrip() {
         enabled: true,
         encrypted: false,
         udp_mtu: Some(512),
+        udp_source_pool: None,
         proxy_protocol: ProxyProtocol::Off,
     };
     start_relay(ingress, public, "udp-plain-fragmented", tunnel);
@@ -761,6 +862,7 @@ async fn udp_encrypted_large_datagram_roundtrip() {
         enabled: true,
         encrypted: true,
         udp_mtu: None,
+        udp_source_pool: None,
         proxy_protocol: ProxyProtocol::Off,
     };
     start_relay(ingress, public, "udp-large", tunnel);
@@ -800,6 +902,7 @@ async fn both_tunnel_roundtrip() {
         enabled: true,
         encrypted: false,
         udp_mtu: None,
+        udp_source_pool: None,
         proxy_protocol: ProxyProtocol::Off,
     };
     start_relay(ingress, public, "both", tunnel);
@@ -828,6 +931,7 @@ async fn both_tunnel_encrypted_roundtrip() {
         enabled: true,
         encrypted: true,
         udp_mtu: None,
+        udp_source_pool: None,
         proxy_protocol: ProxyProtocol::Off,
     };
     start_relay(ingress, public, "both-encrypted", tunnel);
@@ -856,6 +960,7 @@ async fn web_add_tunnel_preserves_encryption_choices() {
         free_port(),
     );
     let (cert, key) = temp_paths("web-encryption");
+    let config_path = temp_client_config("web-encryption");
     let ss = ServerSettings {
         bind_addr: "127.0.0.1".into(),
         control_port: ingress,
@@ -873,7 +978,7 @@ async fn web_add_tunnel_preserves_encryption_choices() {
         fingerprint,
         Vec::new(),
         format!("127.0.0.1:{web}"),
-        None,
+        Some(config_path.clone()),
         false,
     )));
 
@@ -917,7 +1022,8 @@ async fn web_add_tunnel_preserves_encryption_choices() {
             "local": udp_local.to_string(),
             "remote_port": p3,
             "encrypted": false,
-            "udp_mtu": 900
+            "udp_mtu": 900,
+            "udp_source_pool": "127.64.0.0/16"
         }),
     )
     .await;
@@ -937,10 +1043,21 @@ async fn web_add_tunnel_preserves_encryption_choices() {
             t["name"] == "udp-mtu"
                 && t["encrypted"].as_bool() == Some(false)
                 && t["udp_mtu"].as_u64() == Some(900)
+                && t["udp_source_pool"].as_str() == Some("127.64.0.0/16")
         });
         tls && plain && udp_mtu
     })
     .await;
+
+    let persisted: ClientFile =
+        toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    let persisted_pool = persisted
+        .tunnels
+        .iter()
+        .find(|t| t.name == "udp-mtu")
+        .and_then(|t| t.udp_source_pool)
+        .map(|p| p.to_string());
+    assert_eq!(persisted_pool.as_deref(), Some("127.64.0.0/16"));
 }
 
 #[tokio::test]
@@ -963,6 +1080,7 @@ async fn client_reconnects_when_server_starts_late() {
         enabled: true,
         encrypted: false,
         udp_mtu: None,
+        udp_source_pool: None,
         proxy_protocol: ProxyProtocol::Off,
     };
     tokio::spawn(client::run(client_settings(ingress, fingerprint, tunnel)));

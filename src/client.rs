@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::cli::{ClientArgs, JoinArgs};
 use crate::config::{
-    self, save_client_file, ClientFile, ClientSettings, ProxyProtocol, TunnelConfig,
+    self, save_client_file, ClientFile, ClientSettings, ProxyProtocol, TunnelConfig, UdpSourcePool,
 };
 use crate::invite;
 use crate::protocol::{
@@ -49,6 +49,7 @@ pub struct TunnelStatus {
     pub remote_port: Option<u16>,
     pub encrypted: bool,
     pub udp_mtu: Option<u16>,
+    pub udp_source_pool: Option<UdpSourcePool>,
     pub proxy_protocol: ProxyProtocol,
     pub enabled: AtomicBool,
     pub public_addr: Mutex<Option<String>>,
@@ -274,6 +275,7 @@ fn status_from(t: &TunnelConfig) -> TunnelStatus {
         remote_port: t.remote_port,
         encrypted: t.encrypted,
         udp_mtu: config::resolved_udp_mtu(t.protocol, t.udp_mtu),
+        udp_source_pool: t.udp_source_pool,
         proxy_protocol: t.proxy_protocol,
         enabled: AtomicBool::new(t.enabled),
         public_addr: Mutex::new(None),
@@ -291,6 +293,7 @@ fn ensure_status(shared: &ClientShared, t: &TunnelConfig) {
             s.remote_port = t.remote_port;
             s.encrypted = t.encrypted;
             s.udp_mtu = config::resolved_udp_mtu(t.protocol, t.udp_mtu);
+            s.udp_source_pool = t.udp_source_pool;
             s.proxy_protocol = t.proxy_protocol;
             s.enabled.store(t.enabled, Relaxed);
         }
@@ -511,8 +514,8 @@ fn apply_accepted(shared: &Arc<ClientShared>, conn_cancel: &CancellationToken, m
 
     if proto.has_udp() {
         if let Some(token) = token {
-            let (local, counters) = match shared.status.get(&name) {
-                Some(s) => (s.local_addr, s.counters.clone()),
+            let (local, udp_source_pool, counters) = match shared.status.get(&name) {
+                Some(s) => (s.local_addr, s.udp_source_pool, s.counters.clone()),
                 None => return,
             };
             if encrypted {
@@ -520,6 +523,7 @@ fn apply_accepted(shared: &Arc<ClientShared>, conn_cancel: &CancellationToken, m
                     shared.clone(),
                     name,
                     local,
+                    udp_source_pool,
                     token,
                     counters,
                     conn_cancel.clone(),
@@ -549,6 +553,7 @@ fn apply_accepted(shared: &Arc<ClientShared>, conn_cancel: &CancellationToken, m
                         token,
                         key,
                         udp_mtu: udp_mtu.unwrap_or(protocol::DEFAULT_UDP_MTU),
+                        source_pool: udp_source_pool,
                     },
                     counters,
                     conn_cancel.clone(),
@@ -857,6 +862,7 @@ mod tests {
             enabled: true,
             encrypted: false,
             udp_mtu: None,
+            udp_source_pool: None,
             proxy_protocol: ProxyProtocol::Off,
         };
         let existing = ClientFile {
@@ -928,6 +934,7 @@ mod tests {
             enabled: true,
             encrypted: true,
             udp_mtu: Some(900),
+            udp_source_pool: None,
             proxy_protocol: ProxyProtocol::Off,
         };
         let (out_tx, mut out_rx) = mpsc::channel(8);
@@ -975,6 +982,7 @@ mod tests {
             enabled: true,
             encrypted: false,
             udp_mtu: None,
+            udp_source_pool: None,
             proxy_protocol: ProxyProtocol::Off,
         };
         let disabled = TunnelConfig {
@@ -985,6 +993,7 @@ mod tests {
             enabled: false,
             encrypted: false,
             udp_mtu: None,
+            udp_source_pool: None,
             proxy_protocol: ProxyProtocol::Off,
         };
         let file = ClientFile {

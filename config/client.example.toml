@@ -33,6 +33,8 @@ max_files = 14      # 0 disables pruning
 # remote_port is optional (omit or 0 => the server assigns one).
 # encrypted defaults to false for the data channel. Set true to wrap data in TLS.
 # UDP-capable tunnels can set udp_mtu (default 1200, range 256-65507) for plaintext fragmentation.
+# Experimental: UDP-capable loopback tunnels can set udp_source_pool to make distinct
+# Internet UDP peers appear as distinct synthetic 127.x.x.x source IPs to local services.
 [[tunnels]]
 name = "minecraft"
 protocol = "tcp"
@@ -51,3 +53,4 @@ remote_port = 2456
 enabled = true
 encrypted = false
 udp_mtu = 1200
+# udp_source_pool = "127.64.0.0/16"

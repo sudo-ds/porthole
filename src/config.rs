@@ -1,6 +1,6 @@
 //! Configuration: on-disk TOML forms, CLI/env merging, and atomic write-back.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -91,6 +91,8 @@ pub struct TunnelConfig {
     pub encrypted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub udp_mtu: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_source_pool: Option<UdpSourcePool>,
     #[serde(default, skip_serializing_if = "ProxyProtocol::is_off")]
     pub proxy_protocol: ProxyProtocol,
 }
@@ -136,11 +138,89 @@ impl std::str::FromStr for ProxyProtocol {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UdpSourcePool {
+    network: Ipv4Addr,
+    prefix: u8,
+}
+
+impl UdpSourcePool {
+    pub fn size(self) -> u32 {
+        if self.prefix == 32 {
+            1
+        } else {
+            1u32 << (32 - self.prefix)
+        }
+    }
+
+    pub fn addr_at(self, index: u32) -> Option<Ipv4Addr> {
+        if index >= self.size() {
+            return None;
+        }
+        Some(Ipv4Addr::from(u32::from(self.network) + index))
+    }
+}
+
+impl std::fmt::Display for UdpSourcePool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.network, self.prefix)
+    }
+}
+
+impl std::str::FromStr for UdpSourcePool {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let s = s.trim();
+        let (addr, prefix) = s
+            .split_once('/')
+            .with_context(|| format!("invalid udp_source_pool {s:?} (expected IPv4 CIDR)"))?;
+        let ip: Ipv4Addr = addr
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid udp_source_pool address {addr:?}"))?;
+        let prefix: u8 = prefix
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid udp_source_pool prefix {prefix:?}"))?;
+        if !(8..=32).contains(&prefix) {
+            bail!("udp_source_pool must be inside 127.0.0.0/8");
+        }
+        let raw = u32::from(ip);
+        let mask = u32::MAX << (32 - prefix);
+        let network = Ipv4Addr::from(raw & mask);
+        if network.octets()[0] != 127 {
+            bail!("udp_source_pool must be inside 127.0.0.0/8");
+        }
+        Ok(Self { network, prefix })
+    }
+}
+
+impl Serialize for UdpSourcePool {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for UdpSourcePool {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 pub fn validate_tunnel_config(t: &TunnelConfig) -> Result<()> {
     if t.protocol != Proto::Tcp && !t.proxy_protocol.is_off() {
         bail!("proxy_protocol is only supported for tcp-only tunnels");
     }
     validate_udp_mtu(t.protocol, t.udp_mtu)?;
+    validate_udp_source_pool(t.protocol, t.local_addr, t.udp_source_pool)?;
     Ok(())
 }
 
@@ -162,7 +242,24 @@ pub fn resolved_udp_mtu(proto: Proto, udp_mtu: Option<u16>) -> Option<u16> {
         .then_some(udp_mtu.unwrap_or(DEFAULT_UDP_MTU))
 }
 
-/// Parse a `name=proto:LOCAL->REMOTE[;proxy=v1|v2][;encrypted=true|false][;udp_mtu=N]` CLI spec.
+pub fn validate_udp_source_pool(
+    proto: Proto,
+    local_addr: SocketAddr,
+    pool: Option<UdpSourcePool>,
+) -> Result<()> {
+    let Some(_) = pool else {
+        return Ok(());
+    };
+    if !proto.has_udp() {
+        bail!("udp_source_pool is only supported for udp-capable tunnels");
+    }
+    match local_addr.ip() {
+        IpAddr::V4(ip) if ip.is_loopback() => Ok(()),
+        _ => bail!("udp_source_pool requires an IPv4 loopback local_addr"),
+    }
+}
+
+/// Parse a `name=proto:LOCAL->REMOTE[;proxy=v1|v2][;encrypted=true|false][;udp_mtu=N][;udp_source_pool=CIDR]` CLI spec.
 /// `proto` is `tcp`, `udp`, or `both`.
 pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelConfig> {
     let (name, rest) = spec
@@ -181,6 +278,7 @@ pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelConfig> {
     let mut encrypted = false;
     let mut encrypted_set = false;
     let mut udp_mtu = None;
+    let mut udp_source_pool = None;
     for opt in remote_parts {
         let opt = opt.trim();
         if opt.is_empty() {
@@ -213,6 +311,14 @@ pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelConfig> {
                         format!("invalid udp_mtu option {value:?} in {spec:?}")
                     })?);
             }
+            "udp_source_pool" => {
+                if udp_source_pool.is_some() {
+                    bail!("duplicate udp_source_pool option in {spec:?}");
+                }
+                udp_source_pool = Some(value.trim().parse().with_context(|| {
+                    format!("invalid udp_source_pool option {value:?} in {spec:?}")
+                })?);
+            }
             other => bail!("unknown tunnel option {other:?} in {spec:?}"),
         }
     }
@@ -233,6 +339,7 @@ pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelConfig> {
         enabled: true,
         encrypted,
         udp_mtu,
+        udp_source_pool,
         proxy_protocol,
     };
     validate_tunnel_config(&t)?;
@@ -534,6 +641,7 @@ mod tests {
         assert!(t.enabled);
         assert!(!t.encrypted);
         assert_eq!(t.udp_mtu, None);
+        assert_eq!(t.udp_source_pool, None);
         assert_eq!(t.proxy_protocol, ProxyProtocol::Off);
     }
 
@@ -543,6 +651,7 @@ mod tests {
         assert_eq!(t.protocol, Proto::Udp);
         assert_eq!(t.remote_port, None);
         assert!(!t.encrypted);
+        assert_eq!(t.udp_source_pool, None);
         assert_eq!(
             resolved_udp_mtu(t.protocol, t.udp_mtu),
             Some(DEFAULT_UDP_MTU)
@@ -586,6 +695,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_spec_accepts_udp_source_pool() {
+        let t =
+            parse_tunnel_spec("g=udp:127.0.0.1:19132->0;udp_source_pool=127.64.0.0/16").unwrap();
+        assert_eq!(t.udp_source_pool.unwrap().to_string(), "127.64.0.0/16");
+    }
+
+    #[test]
     fn parse_spec_rejects_garbage() {
         assert!(parse_tunnel_spec("nope").is_err());
         assert!(parse_tunnel_spec("a=tcp:badaddr->1").is_err());
@@ -597,6 +713,11 @@ mod tests {
         assert!(parse_tunnel_spec("a=tcp:127.0.0.1:1->2;udp_mtu=1200").is_err());
         assert!(parse_tunnel_spec("a=udp:127.0.0.1:1->2;udp_mtu=255").is_err());
         assert!(parse_tunnel_spec("a=udp:127.0.0.1:1->2;udp_mtu=65508").is_err());
+        assert!(parse_tunnel_spec("a=tcp:127.0.0.1:1->2;udp_source_pool=127.64.0.0/16").is_err());
+        assert!(parse_tunnel_spec("a=udp:127.0.0.1:1->2;udp_source_pool=10.0.0.0/24").is_err());
+        assert!(parse_tunnel_spec("a=udp:[::1]:1->2;udp_source_pool=127.64.0.0/16").is_err());
+        assert!(parse_tunnel_spec("a=udp:192.0.2.10:1->2;udp_source_pool=127.64.0.0/16").is_err());
+        assert!(parse_tunnel_spec("a=udp:127.0.0.1:1->2;udp_source_pool=::1/128").is_err());
     }
 
     #[test]
@@ -613,10 +734,12 @@ remote_port = 25565
         assert_eq!(t.proxy_protocol, ProxyProtocol::Off);
         assert!(!t.encrypted);
         assert_eq!(t.udp_mtu, None);
+        assert_eq!(t.udp_source_pool, None);
 
         let text = toml::to_string(&t).unwrap();
         assert!(!text.contains("proxy_protocol"));
         assert!(!text.contains("udp_mtu"));
+        assert!(!text.contains("udp_source_pool"));
     }
 
     #[test]
@@ -700,6 +823,63 @@ udp_mtu = 900
         assert_eq!(resolved_udp_mtu(t.protocol, t.udp_mtu), Some(900));
         assert!(validate_tunnel_config(&t).is_ok());
         assert!(toml::to_string(&t).unwrap().contains("udp_mtu = 900"));
+    }
+
+    #[test]
+    fn tunnel_udp_source_pool_serializes_when_present() {
+        let t: TunnelConfig = toml::from_str(
+            r#"
+name = "udp"
+protocol = "udp"
+local_addr = "127.0.0.1:19132"
+remote_port = 19132
+udp_source_pool = "127.64.0.0/16"
+"#,
+        )
+        .unwrap();
+        assert_eq!(t.udp_source_pool.unwrap().to_string(), "127.64.0.0/16");
+        assert!(validate_tunnel_config(&t).is_ok());
+        assert!(toml::to_string(&t)
+            .unwrap()
+            .contains("udp_source_pool = \"127.64.0.0/16\""));
+    }
+
+    #[test]
+    fn validate_rejects_bad_udp_source_pool_usage() {
+        let t: TunnelConfig = toml::from_str(
+            r#"
+name = "tcp"
+protocol = "tcp"
+local_addr = "127.0.0.1:25565"
+remote_port = 25565
+udp_source_pool = "127.64.0.0/16"
+"#,
+        )
+        .unwrap();
+        assert!(validate_tunnel_config(&t).is_err());
+
+        let t: TunnelConfig = toml::from_str(
+            r#"
+name = "udp"
+protocol = "udp"
+local_addr = "192.0.2.10:19132"
+remote_port = 19132
+udp_source_pool = "127.64.0.0/16"
+"#,
+        )
+        .unwrap();
+        assert!(validate_tunnel_config(&t).is_err());
+
+        assert!(toml::from_str::<TunnelConfig>(
+            r#"
+name = "udp"
+protocol = "udp"
+local_addr = "127.0.0.1:19132"
+remote_port = 19132
+udp_source_pool = "10.0.0.0/24"
+"#,
+        )
+        .is_err());
     }
 
     #[test]
