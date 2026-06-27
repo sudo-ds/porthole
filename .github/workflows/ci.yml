@@ -34,6 +34,11 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
 
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-${{ matrix.os }}
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
