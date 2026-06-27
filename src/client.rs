@@ -47,6 +47,7 @@ pub struct TunnelStatus {
     pub proto: Proto,
     pub local_addr: SocketAddr,
     pub remote_port: Option<u16>,
+    pub encrypted: bool,
     pub proxy_protocol: ProxyProtocol,
     pub enabled: AtomicBool,
     pub public_addr: Mutex<Option<String>>,
@@ -270,6 +271,7 @@ fn status_from(t: &TunnelConfig) -> TunnelStatus {
         proto: t.protocol,
         local_addr: t.local_addr,
         remote_port: t.remote_port,
+        encrypted: t.encrypted,
         proxy_protocol: t.proxy_protocol,
         enabled: AtomicBool::new(t.enabled),
         public_addr: Mutex::new(None),
@@ -285,6 +287,7 @@ fn ensure_status(shared: &ClientShared, t: &TunnelConfig) {
             s.proto = t.protocol;
             s.local_addr = t.local_addr;
             s.remote_port = t.remote_port;
+            s.encrypted = t.encrypted;
             s.proxy_protocol = t.proxy_protocol;
             s.enabled.store(t.enabled, Relaxed);
         }
@@ -415,6 +418,7 @@ async fn connect_and_run(shared: &Arc<ClientShared>) -> Result<()> {
                 name: t.name.clone(),
                 proto: t.protocol,
                 remote_port: t.remote_port,
+                encrypted: t.encrypted,
             })
             .await;
     }
@@ -425,27 +429,27 @@ async fn connect_and_run(shared: &Arc<ClientShared>) -> Result<()> {
             Ok(None) => break Ok(()),
             Ok(Some(Err(e))) => break Err(e.into()),
             Ok(Some(Ok(frame))) => match serde_json::from_slice::<ServerMessage>(&frame) {
-                Ok(ServerMessage::Accepted {
-                    name,
-                    proto,
-                    remote_port,
-                    token,
-                    ..
-                }) => {
-                    apply_accepted(shared, &conn_cancel, name, proto, remote_port, token);
+                Ok(msg @ ServerMessage::Accepted { .. }) => {
+                    apply_accepted(shared, &conn_cancel, msg);
                 }
                 Ok(ServerMessage::NewConn {
                     id,
                     tunnel,
                     src_addr,
                     dst_addr,
+                    encrypted,
+                    data_auth,
                 }) => {
                     tokio::spawn(tcp::client_handle_conn(
                         shared.clone(),
-                        id,
-                        tunnel,
-                        src_addr,
-                        dst_addr,
+                        tcp::ClientConn {
+                            id,
+                            tunnel,
+                            src_addr,
+                            dst_addr,
+                            encrypted,
+                            data_auth,
+                        },
                         conn_cancel.clone(),
                     ));
                 }
@@ -475,14 +479,19 @@ async fn connect_and_run(shared: &Arc<ClientShared>) -> Result<()> {
     outcome
 }
 
-fn apply_accepted(
-    shared: &Arc<ClientShared>,
-    conn_cancel: &CancellationToken,
-    name: String,
-    proto: Proto,
-    remote_port: u16,
-    token: Option<Uuid>,
-) {
+fn apply_accepted(shared: &Arc<ClientShared>, conn_cancel: &CancellationToken, msg: ServerMessage) {
+    let ServerMessage::Accepted {
+        name,
+        proto,
+        remote_port,
+        encrypted,
+        token,
+        udp_auth_key,
+        ..
+    } = msg
+    else {
+        return;
+    };
     let public = public_endpoint(
         shared.public_addr.as_deref(),
         &shared.server_addr,
@@ -501,14 +510,42 @@ fn apply_accepted(
                 Some(s) => (s.local_addr, s.counters.clone()),
                 None => return,
             };
-            tokio::spawn(udp::client_channel(
-                shared.clone(),
-                name,
-                local,
-                token,
-                counters,
-                conn_cancel.clone(),
-            ));
+            if encrypted {
+                tokio::spawn(udp::client_channel(
+                    shared.clone(),
+                    name,
+                    local,
+                    token,
+                    counters,
+                    conn_cancel.clone(),
+                ));
+            } else {
+                let Some(key_text) = udp_auth_key else {
+                    tracing::warn!("udp tunnel '{name}' missing plaintext auth key");
+                    return;
+                };
+                let key = match protocol::decode_udp_auth_key(&key_text) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        tracing::warn!("udp tunnel '{name}' has invalid plaintext auth key: {e:#}");
+                        return;
+                    }
+                };
+                let server_udp = public_endpoint(
+                    shared.public_addr.as_deref(),
+                    &shared.server_addr,
+                    remote_port,
+                );
+                tokio::spawn(udp::client_plain_channel(
+                    name,
+                    local,
+                    server_udp,
+                    token,
+                    key,
+                    counters,
+                    conn_cancel.clone(),
+                ));
+            }
         }
     }
 }
@@ -549,12 +586,34 @@ pub async fn connect_data_wire(shared: &ClientShared, id: Uuid) -> Result<Wire<C
     protocol::send_msg(
         &mut wire,
         &ClientMessage::DataHello {
-            token: shared.secret.clone(),
+            token: Some(shared.secret.clone()),
             id,
+            data_auth: None,
         },
     )
     .await?;
     Ok(wire)
+}
+
+/// Open a plaintext TCP data connection identified by `id`.
+pub async fn connect_plain_data_stream(
+    shared: &ClientShared,
+    id: Uuid,
+    data_auth: String,
+) -> Result<protocol::Prefixed<TcpStream>> {
+    let tcp = TcpStream::connect(&shared.server_addr).await?;
+    net::set_keepalive(&tcp);
+    let mut wire = protocol::wire(tcp);
+    protocol::send_msg(
+        &mut wire,
+        &ClientMessage::DataHello {
+            token: None,
+            id,
+            data_auth: Some(data_auth),
+        },
+    )
+    .await?;
+    Ok(protocol::into_raw(wire))
 }
 
 // ---------------------------------------------------------------------------
@@ -653,6 +712,7 @@ async fn register_tunnel(shared: &Arc<ClientShared>, t: &TunnelConfig) {
             name: t.name.clone(),
             proto: t.protocol,
             remote_port: t.remote_port,
+            encrypted: t.encrypted,
         },
     )
     .await;
@@ -786,6 +846,7 @@ mod tests {
             local_addr: "127.0.0.1:25565".parse().unwrap(),
             remote_port: Some(25565),
             enabled: true,
+            encrypted: false,
             proxy_protocol: ProxyProtocol::Off,
         };
         let existing = ClientFile {
@@ -856,6 +917,7 @@ mod tests {
             local_addr: "127.0.0.1:25565".parse().unwrap(),
             remote_port: Some(25565),
             enabled: true,
+            encrypted: false,
             proxy_protocol: ProxyProtocol::Off,
         };
         let disabled = TunnelConfig {
@@ -864,6 +926,7 @@ mod tests {
             local_addr: "127.0.0.1:25566".parse().unwrap(),
             remote_port: Some(25566),
             enabled: false,
+            encrypted: false,
             proxy_protocol: ProxyProtocol::Off,
         };
         let file = ClientFile {
@@ -901,7 +964,8 @@ mod tests {
             ClientMessage::Register {
                 name: "enabled".into(),
                 proto: Proto::Tcp,
-                remote_port: Some(25565)
+                remote_port: Some(25565),
+                encrypted: false
             }
         );
         assert!(out_rx.try_recv().is_err());

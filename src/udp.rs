@@ -9,18 +9,21 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::UdpSocket;
+use tokio::net::{lookup_host, UdpSocket};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::client::{ClientShared, Counters};
-use crate::protocol::{decode_udp, encode_udp, Wire, UDP_IDLE_TIMEOUT};
+use crate::protocol::{
+    decode_plain_udp, decode_udp, encode_plain_udp, encode_udp, PlainUdpKind, Wire,
+    UDP_IDLE_TIMEOUT, UDP_PLAINTEXT_KEEPALIVE, UDP_PLAINTEXT_MAX_PACKET,
+};
 use crate::server::ServerTls;
 
 const MAX_DATAGRAM: usize = 65_535;
@@ -125,6 +128,71 @@ where
     Ok(())
 }
 
+/// Native plaintext UDP data channel. Public datagrams and authenticated client packets share
+/// the tunnel's public UDP socket; valid client hello packets pin/update the client endpoint.
+pub async fn server_plain_forward(
+    socket: Arc<UdpSocket>,
+    token: Uuid,
+    key: [u8; 32],
+    cancel: CancellationToken,
+) -> Result<()> {
+    let mut buf = vec![0u8; MAX_DATAGRAM];
+    let mut client: Option<SocketAddr> = None;
+    let mut seq = 0u64;
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            r = socket.recv_from(&mut buf) => {
+                let (n, peer) = match r {
+                    Ok(x) => x,
+                    Err(e) => {
+                        tracing::debug!("udp plaintext recv_from: {e}");
+                        break;
+                    }
+                };
+                let packet = &buf[..n];
+                match decode_plain_udp(packet, &key) {
+                    Ok((PlainUdpKind::Hello, _, body)) => {
+                        if body == token.as_bytes() {
+                            client = Some(peer);
+                        }
+                    }
+                    Ok((PlainUdpKind::Keepalive, _, _)) => {
+                        if client != Some(peer) {
+                            tracing::trace!("ignored plaintext udp keepalive from unpinned endpoint {peer}");
+                        }
+                    }
+                    Ok((PlainUdpKind::Data, _, body)) => {
+                        if client != Some(peer) {
+                            tracing::trace!("ignored plaintext udp data from unpinned endpoint {peer}");
+                            continue;
+                        }
+                        if let Ok((dst, data)) = decode_udp(body) {
+                            let _ = socket.send_to(data, dst).await;
+                        }
+                    }
+                    Err(_) => {
+                        if client == Some(peer) {
+                            continue;
+                        }
+                        let Some(client) = client else {
+                            continue;
+                        };
+                        let body = encode_udp(peer, packet);
+                        let Some(out) = encode_plain_udp(PlainUdpKind::Data, next_seq(&mut seq), &body, &key) else {
+                            tracing::debug!("dropping udp plaintext datagram that exceeds no-fragment packet limit");
+                            continue;
+                        };
+                        let _ = socket.send_to(&out, client).await;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Client side
 // ---------------------------------------------------------------------------
@@ -166,6 +234,42 @@ pub async fn client_channel(
             backoff = Duration::from_secs(1);
         }
         tracing::info!("udp channel for '{tunnel}' dropped; re-dialing in {backoff:?}");
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
+}
+
+/// Run a native UDP data channel for a plaintext UDP tunnel.
+pub async fn client_plain_channel(
+    tunnel: String,
+    local: SocketAddr,
+    server_udp: String,
+    token: Uuid,
+    key: [u8; 32],
+    counters: Arc<Counters>,
+    cancel: CancellationToken,
+) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let started = Instant::now();
+        if let Err(e) =
+            run_plain_udp_channel(&tunnel, local, &server_udp, token, key, &counters, &cancel).await
+        {
+            tracing::warn!("plaintext udp channel for '{tunnel}' failed: {e:#}");
+        }
+        if cancel.is_cancelled() {
+            break;
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            backoff = Duration::from_secs(1);
+        }
+        tracing::info!("plaintext udp channel for '{tunnel}' dropped; re-dialing in {backoff:?}");
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = tokio::time::sleep(backoff) => {}
@@ -305,6 +409,150 @@ async fn run_udp_channel(
     janitor.abort();
 }
 
+async fn run_plain_udp_channel(
+    tunnel: &str,
+    local: SocketAddr,
+    server_udp: &str,
+    token: Uuid,
+    key: [u8; 32],
+    counters: &Arc<Counters>,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let channel = Arc::new(connect_plain_udp_socket(server_udp).await?);
+    let link = cancel.child_token();
+    let started = Instant::now();
+
+    let flows: Arc<DashMap<SocketAddr, FlowEntry>> = Arc::new(DashMap::new());
+    let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(OUTBOUND_QUEUE);
+    let seq = Arc::new(AtomicU64::new(0));
+
+    let writer = {
+        let channel = channel.clone();
+        let writer_cancel = link.clone();
+        let seq = seq.clone();
+        tokio::spawn(async move {
+            let _ =
+                send_plain_udp_packet(&channel, PlainUdpKind::Hello, &seq, token.as_bytes(), &key)
+                    .await;
+            let mut keepalive = tokio::time::interval(UDP_PLAINTEXT_KEEPALIVE);
+            loop {
+                tokio::select! {
+                    _ = writer_cancel.cancelled() => break,
+                    _ = keepalive.tick() => {
+                        if send_plain_udp_packet(&channel, PlainUdpKind::Keepalive, &seq, &[], &key).await.is_err() {
+                            break;
+                        }
+                    }
+                    b = out_rx.recv() => {
+                        let Some(body) = b else { break };
+                        if send_plain_udp_packet(&channel, PlainUdpKind::Data, &seq, &body, &key).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+    };
+
+    let janitor = {
+        let flows = flows.clone();
+        let cancel = link.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(10));
+            let idle_ms = UDP_IDLE_TIMEOUT.as_millis() as u64;
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let now = epoch_ms(&started);
+                        let expired: Vec<SocketAddr> = flows
+                            .iter()
+                            .filter(|e| now.saturating_sub(e.value().last_seen.load(Relaxed)) > idle_ms)
+                            .map(|e| *e.key())
+                            .collect();
+                        for addr in expired {
+                            if let Some((_, entry)) = flows.remove(&addr) {
+                                entry.cancel.cancel();
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    };
+
+    let mut buf = vec![0u8; UDP_PLAINTEXT_MAX_PACKET];
+    loop {
+        tokio::select! {
+            _ = link.cancelled() => break,
+            r = channel.recv(&mut buf) => {
+                let n = match r {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::debug!("plaintext udp channel recv for '{tunnel}': {e}");
+                        break;
+                    }
+                };
+                let (kind, _, body) = match decode_plain_udp(&buf[..n], &key) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        tracing::debug!("plaintext udp channel decode for '{tunnel}': {e:#}");
+                        continue;
+                    }
+                };
+                if kind != PlainUdpKind::Data {
+                    continue;
+                }
+                let (src, data) = match decode_udp(body) { Ok(x) => x, Err(_) => continue };
+                counters.bytes_in.fetch_add(data.len() as u64, Relaxed);
+                let now = epoch_ms(&started);
+
+                let sock = match flows.get(&src) {
+                    Some(e) => {
+                        e.last_seen.store(now, Relaxed);
+                        e.sock.clone()
+                    }
+                    None => {
+                        if flows.len() >= MAX_FLOWS {
+                            continue;
+                        }
+                        let sock = match bind_local_flow(local).await {
+                            Ok(s) => Arc::new(s),
+                            Err(e) => { tracing::debug!("opening plaintext udp flow socket: {e}"); continue; }
+                        };
+                        let flow_cancel = link.child_token();
+                        let last_seen = Arc::new(AtomicU64::new(now));
+                        flows.insert(
+                            src,
+                            FlowEntry {
+                                sock: sock.clone(),
+                                cancel: flow_cancel.clone(),
+                                last_seen: last_seen.clone(),
+                            },
+                        );
+                        tokio::spawn(flow_reader(
+                            src,
+                            sock.clone(),
+                            out_tx.clone(),
+                            last_seen,
+                            counters.clone(),
+                            flow_cancel,
+                            started,
+                        ));
+                        sock
+                    }
+                };
+                let _ = sock.send(data).await;
+            }
+        }
+    }
+
+    link.cancel();
+    let _ = writer.await;
+    janitor.abort();
+    Ok(())
+}
+
 /// Per-flow task: read replies from the local service and queue them back to the server.
 async fn flow_reader(
     src: SocketAddr,
@@ -332,6 +580,37 @@ async fn flow_reader(
     }
 }
 
+async fn send_plain_udp_packet(
+    channel: &UdpSocket,
+    kind: PlainUdpKind,
+    seq: &AtomicU64,
+    body: &[u8],
+    key: &[u8; 32],
+) -> Result<()> {
+    let Some(packet) = encode_plain_udp(kind, seq.fetch_add(1, Relaxed), body, key) else {
+        tracing::debug!("dropping udp plaintext datagram that exceeds no-fragment packet limit");
+        return Ok(());
+    };
+    channel.send(&packet).await?;
+    Ok(())
+}
+
+async fn connect_plain_udp_socket(server_udp: &str) -> Result<UdpSocket> {
+    let server = lookup_host(server_udp)
+        .await
+        .with_context(|| format!("resolving udp data endpoint {server_udp}"))?
+        .next()
+        .with_context(|| format!("udp data endpoint {server_udp} resolved to no addresses"))?;
+    let bind: SocketAddr = if server.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
+    let sock = UdpSocket::bind(bind).await?;
+    sock.connect(server).await?;
+    Ok(sock)
+}
+
 async fn bind_local_flow(local: SocketAddr) -> std::io::Result<UdpSocket> {
     let bind: SocketAddr = if local.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
@@ -346,6 +625,12 @@ async fn bind_local_flow(local: SocketAddr) -> std::io::Result<UdpSocket> {
 /// Milliseconds elapsed since `started`; the monotonic timestamp stored per flow.
 fn epoch_ms(started: &Instant) -> u64 {
     started.elapsed().as_millis() as u64
+}
+
+fn next_seq(seq: &mut u64) -> u64 {
+    let out = *seq;
+    *seq = (*seq).wrapping_add(1);
+    out
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ use bytes::Bytes;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
+use rand::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
@@ -129,6 +130,21 @@ pub async fn run_with_shutdown(
 impl Server {
     async fn handle_inbound(&self, tcp: TcpStream, peer: SocketAddr) -> Result<()> {
         net::set_keepalive(&tcp);
+        let mut first = [0u8; 1];
+        let n = tokio::time::timeout(NETWORK_TIMEOUT, tcp.peek(&mut first))
+            .await
+            .context("timed out waiting for first byte")??;
+        if n == 0 {
+            bail!("connection closed before first byte from {peer}");
+        }
+        if first[0] != 0x16 {
+            return self.handle_plain_data_conn(tcp, peer).await;
+        }
+
+        self.handle_tls_inbound(tcp, peer).await
+    }
+
+    async fn handle_tls_inbound(&self, tcp: TcpStream, peer: SocketAddr) -> Result<()> {
         // Bound the TLS handshake: a peer that completes the TCP connect but stalls the
         // handshake would otherwise park this task indefinitely (slowloris-style).
         let tls = tokio::time::timeout(NETWORK_TIMEOUT, self.acceptor.accept(tcp))
@@ -149,21 +165,70 @@ impl Server {
                 }
                 self.handle_control(wire, peer).await
             }
-            ClientMessage::DataHello { token, id } => {
-                if !auth::verify_token(&self.settings.secret, &token) {
+            ClientMessage::DataHello { token, id, .. } => {
+                if !auth::verify_token(&self.settings.secret, token.as_deref().unwrap_or_default())
+                {
                     let _ = protocol::send_msg(&mut wire, &auth_error()).await;
                     bail!("authentication failed (data) from {peer}");
                 }
-                self.handle_data_conn(wire, id).await
+                self.handle_tls_data_conn(wire, id).await
             }
             _ => bail!("unexpected first frame from {peer}"),
         }
     }
 
-    /// A data connection: route it to the waiting TCP accept or the UDP tunnel by id.
-    async fn handle_data_conn(&self, wire: Wire<ServerTls>, id: Uuid) -> Result<()> {
-        if let Some((_, tx)) = self.pending.remove(&id) {
-            let _ = tx.send(protocol::into_raw(wire));
+    async fn handle_plain_data_conn(&self, tcp: TcpStream, peer: SocketAddr) -> Result<()> {
+        let mut wire = protocol::wire(tcp);
+        let first: ClientMessage = protocol::recv_msg_timeout(&mut wire, NETWORK_TIMEOUT)
+            .await
+            .context("reading plaintext data handshake frame")?;
+        let ClientMessage::DataHello {
+            token,
+            id,
+            data_auth,
+        } = first
+        else {
+            bail!("plaintext connection from {peer} did not start with DataHello");
+        };
+        if token.is_some() {
+            bail!("plaintext data connection from {peer} included shared-token auth");
+        }
+        let data_auth = data_auth.context("plaintext data connection missing data_auth")?;
+
+        let Some(entry) = self.pending.get(&id) else {
+            bail!("plaintext data connection for unknown/expired id {id}");
+        };
+        let encrypted = entry.encrypted;
+        let auth_ok = auth::verify_token(&entry.data_auth, &data_auth);
+        drop(entry);
+
+        if encrypted {
+            bail!("plaintext data connection for encrypted id {id}");
+        }
+        if !auth_ok {
+            bail!("plaintext data authentication failed for id {id}");
+        }
+
+        if let Some((_, pending)) = self.pending.remove(&id) {
+            let raw: tcp::BoxedRelayIo = Box::new(protocol::into_raw(wire));
+            let _ = pending.tx.send(raw);
+        }
+        Ok(())
+    }
+
+    /// A TLS data connection: route it to the waiting TCP accept or the UDP tunnel by id.
+    async fn handle_tls_data_conn(&self, wire: Wire<ServerTls>, id: Uuid) -> Result<()> {
+        if let Some(entry) = self.pending.get(&id) {
+            let encrypted = entry.encrypted;
+            drop(entry);
+            if !encrypted {
+                tracing::debug!("TLS data connection for plaintext id {id}");
+                return Ok(());
+            }
+            if let Some((_, pending)) = self.pending.remove(&id) {
+                let raw: tcp::BoxedRelayIo = Box::new(protocol::into_raw(wire));
+                let _ = pending.tx.send(raw);
+            }
             return Ok(());
         }
         if let Some((_, pending)) = self.udp_pending.remove(&id) {
@@ -265,8 +330,10 @@ impl Server {
                         name,
                         proto,
                         remote_port,
+                        encrypted,
                     }) => {
-                        self.register(&mut session, name, proto, remote_port).await;
+                        self.register(&mut session, name, proto, remote_port, encrypted)
+                            .await;
                     }
                     Ok(ClientMessage::Unregister { name }) => self.unregister(&mut session, &name),
                     Ok(ClientMessage::Heartbeat) => {}
@@ -290,6 +357,7 @@ impl Server {
         name: String,
         proto: Proto,
         remote_port: Option<u16>,
+        encrypted: bool,
     ) {
         let tx = session.control_tx.clone();
 
@@ -342,6 +410,7 @@ impl Server {
                         tokio::spawn(tcp::server_listener(
                             listener,
                             name.clone(),
+                            encrypted,
                             tx.clone(),
                             self.pending.clone(),
                             cancel,
@@ -354,7 +423,9 @@ impl Server {
                                 proto,
                                 public_addr,
                                 remote_port: port,
+                                encrypted,
                                 token: None,
+                                udp_auth_key: None,
                             })
                             .await;
                         return;
@@ -368,17 +439,33 @@ impl Server {
                 Proto::Udp => match net::bind_udp(addr) {
                     Ok(socket) => {
                         let token = Uuid::new_v4();
-                        self.udp_pending.insert(
-                            token,
-                            PendingUdp {
-                                socket: Arc::new(socket),
-                                port,
-                                session: session.id,
+                        let socket = Arc::new(socket);
+                        let udp_auth_key = if encrypted {
+                            self.udp_pending.insert(
+                                token,
+                                PendingUdp {
+                                    socket: socket.clone(),
+                                    port,
+                                    session: session.id,
+                                    cancel,
+                                },
+                            );
+                            None
+                        } else {
+                            let mut key = [0u8; 32];
+                            rand::thread_rng().fill_bytes(&mut key);
+                            tokio::spawn(udp::server_plain_forward(
+                                socket.clone(),
+                                token,
+                                key,
                                 cancel,
-                            },
-                        );
+                            ));
+                            Some(protocol::encode_udp_auth_key(&key))
+                        };
                         session.ports.push(port);
-                        session.udp_tokens.push(token);
+                        if encrypted {
+                            session.udp_tokens.push(token);
+                        }
                         tracing::info!("tunnel '{name}' (udp) -> public port {port}");
                         let _ = tx
                             .send(ServerMessage::Accepted {
@@ -386,7 +473,9 @@ impl Server {
                                 proto,
                                 public_addr,
                                 remote_port: port,
+                                encrypted,
                                 token: Some(token),
+                                udp_auth_key,
                             })
                             .await;
                         return;

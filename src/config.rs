@@ -85,6 +85,8 @@ pub struct TunnelConfig {
     pub remote_port: Option<u16>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub encrypted: bool,
     #[serde(default, skip_serializing_if = "ProxyProtocol::is_off")]
     pub proxy_protocol: ProxyProtocol,
 }
@@ -137,7 +139,7 @@ pub fn validate_tunnel_config(t: &TunnelConfig) -> Result<()> {
     Ok(())
 }
 
-/// Parse a `name=proto:LOCAL->REMOTE[;proxy=v1|v2]` CLI spec.
+/// Parse a `name=proto:LOCAL->REMOTE[;proxy=v1|v2][;encrypted=true|false]` CLI spec.
 pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelConfig> {
     let (name, rest) = spec
         .split_once('=')
@@ -152,6 +154,8 @@ pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelConfig> {
     let remote = remote_parts.next().unwrap_or_default();
     let mut proxy_protocol = ProxyProtocol::Off;
     let mut proxy_set = false;
+    let mut encrypted = false;
+    let mut encrypted_set = false;
     for opt in remote_parts {
         let opt = opt.trim();
         if opt.is_empty() {
@@ -167,6 +171,13 @@ pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelConfig> {
                 }
                 proxy_protocol = value.parse()?;
                 proxy_set = true;
+            }
+            "encrypted" | "encrypt" | "tls" => {
+                if encrypted_set {
+                    bail!("duplicate encrypted option in {spec:?}");
+                }
+                encrypted = parse_bool_option(value)?;
+                encrypted_set = true;
             }
             other => bail!("unknown tunnel option {other:?} in {spec:?}"),
         }
@@ -186,10 +197,19 @@ pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelConfig> {
         local_addr,
         remote_port: (remote_port != 0).then_some(remote_port),
         enabled: true,
+        encrypted,
         proxy_protocol,
     };
     validate_tunnel_config(&t)?;
     Ok(t)
+}
+
+fn parse_bool_option(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "on" | "yes" | "1" => Ok(true),
+        "false" | "off" | "no" | "0" => Ok(false),
+        other => bail!("invalid boolean option {other:?} (expected true or false)"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +497,7 @@ mod tests {
         assert_eq!(t.local_addr, "127.0.0.1:25565".parse().unwrap());
         assert_eq!(t.remote_port, Some(25565));
         assert!(t.enabled);
+        assert!(!t.encrypted);
         assert_eq!(t.proxy_protocol, ProxyProtocol::Off);
     }
 
@@ -485,6 +506,7 @@ mod tests {
         let t = parse_tunnel_spec("g=udp:127.0.0.1:19132->0").unwrap();
         assert_eq!(t.protocol, Proto::Udp);
         assert_eq!(t.remote_port, None);
+        assert!(!t.encrypted);
         assert_eq!(t.proxy_protocol, ProxyProtocol::Off);
     }
 
@@ -495,11 +517,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_spec_accepts_encrypted_suffix_aliases() {
+        let t = parse_tunnel_spec("mc=tcp:127.0.0.1:25565->25565;encrypted=true").unwrap();
+        assert!(t.encrypted);
+
+        let t = parse_tunnel_spec("mc=tcp:127.0.0.1:25565->25565;tls=off").unwrap();
+        assert!(!t.encrypted);
+    }
+
+    #[test]
     fn parse_spec_rejects_garbage() {
         assert!(parse_tunnel_spec("nope").is_err());
         assert!(parse_tunnel_spec("a=tcp:badaddr->1").is_err());
         assert!(parse_tunnel_spec("a=ftp:127.0.0.1:1->2").is_err());
         assert!(parse_tunnel_spec("a=tcp:127.0.0.1:1->2;banana=v1").is_err());
+        assert!(parse_tunnel_spec("a=tcp:127.0.0.1:1->2;encrypted=maybe").is_err());
         assert!(parse_tunnel_spec("a=udp:127.0.0.1:1->2;proxy=v1").is_err());
     }
 
@@ -515,6 +547,7 @@ remote_port = 25565
         )
         .unwrap();
         assert_eq!(t.proxy_protocol, ProxyProtocol::Off);
+        assert!(!t.encrypted);
 
         let text = toml::to_string(&t).unwrap();
         assert!(!text.contains("proxy_protocol"));

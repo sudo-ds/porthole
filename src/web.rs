@@ -69,6 +69,7 @@ struct TunnelView {
     proto: String,
     local: String,
     remote_port: Option<u16>,
+    encrypted: bool,
     proxy_protocol: String,
     public: Option<String>,
     enabled: bool,
@@ -91,6 +92,7 @@ async fn status(State(st): State<AppState>) -> Json<StatusResponse> {
                 proto: s.proto.to_string(),
                 local: s.local_addr.to_string(),
                 remote_port: s.remote_port,
+                encrypted: s.encrypted,
                 proxy_protocol: s.proxy_protocol.to_string(),
                 public: s.public_addr.lock().unwrap().clone(),
                 enabled: s.enabled.load(Relaxed),
@@ -121,6 +123,7 @@ struct AddRequest {
     proto: String,
     local: String,
     remote_port: Option<u16>,
+    encrypted: Option<bool>,
     proxy_protocol: Option<String>,
 }
 
@@ -168,6 +171,7 @@ async fn add_tunnel(State(st): State<AppState>, Json(req): Json<AddRequest>) -> 
         local_addr,
         remote_port: req.remote_port.filter(|p| *p != 0),
         enabled: true,
+        encrypted: req.encrypted.unwrap_or(false),
         proxy_protocol,
     };
     if let Err(e) = config::validate_tunnel_config(&tunnel) {

@@ -20,7 +20,7 @@ public internet through a server you control (e.g. a $5 VPS).
 - Optional TCP source IP forwarding with **PROXY protocol v1/v2**
 - **Share one connection code** — no certs, fingerprints, or config files to hand-edit
 - **Live terminal dashboard** (logo + stats + logs) and an **interactive web UI**
-- **TLS everywhere** with certificate pinning + a shared token — secure by default
+- **TLS-pinned control** with optional per-tunnel data encryption
 - A single static binary; one `porthole server`, one `porthole client`
 
 ## Quick start — share a connection code
@@ -65,8 +65,8 @@ porthole client      # prompts: "Paste your connection code:" (or set it up in t
 ## How it works
 
 The client is behind NAT and can't accept inbound connections, so it makes an **outbound** TLS
-connection to the server (which always works through NAT). The server has a public IP and
-relays public traffic back over connections the client opened.
+control connection to the server (which always works through NAT). The server has a public IP
+and relays public traffic back over data channels the client opened.
 
 ```
    end user            porthole SERVER                  porthole CLIENT          your service
@@ -88,11 +88,13 @@ relays public traffic back over connections the client opened.
   carries auth, tunnel registration, and "a connection arrived" notifications.
 - **TCP** — when someone hits a public port, the server tells the client; the client opens a
   fresh outbound data connection (paired by an unguessable id) and the server splices the two.
-- **UDP** — datagrams are multiplexed over one data connection per tunnel, tagged with the
-  end-user's address.
-- **Security** — all hops between client and server are TLS. The server uses a self-signed
-  certificate; its fingerprint travels inside the connection code, so the client pins it (no
-  CA or domain needed). A shared token (also in the code) authenticates the client.
+  TCP data channels are plaintext by default; set `encrypted = true` to wrap them in TLS.
+- **UDP** — plaintext UDP tunnels use a native authenticated UDP data channel for lower latency.
+  Set `encrypted = true` to use the compatibility path that multiplexes UDP over TLS/TCP.
+- **Security** — control traffic is always TLS. The server uses a self-signed certificate; its
+  fingerprint travels inside the connection code, so the client pins it (no CA or domain needed).
+  A shared token (also in the code) authenticates the client. Plain data channels are not
+  encrypted; plaintext UDP packets are authenticated to prevent off-path injection.
 
 ## The client experience
 
@@ -102,7 +104,7 @@ On an interactive terminal the client shows a live dashboard:
        .-"""""-.
      .'  o o o  '.        ... (purple logo) ...
        '-.....-'
-  client · v0.4.0
+  client · v0.5.0
 
   ● connected to 10xdev.sk:7835    public ports 1024-65535
 
@@ -140,7 +142,7 @@ porthole gen-token
   `--secret-file`, or a `secret = "..."` entry in the client config instead of `join`.
 - Set `public_addr = "10xdev.sk"` in the client config, or pass `--public-addr HOST`,
   to show tunnel endpoints as `HOST:<public_port>` while still dialing `server_addr` for the
-  control/data connections.
+  control connection and encrypted TCP data connections.
 - Config files (`porthole-server.toml`, `porthole-client.toml`) are created next to the binary
   and updated as you change tunnels or pause/unpause them. See `config/*.example.toml`.
 - `porthole server`, `porthole client`, and `porthole join` write daily rotated logs to
@@ -192,8 +194,9 @@ PORTHOLE_SECRET=... porthole client \
   --tunnel mc=tcp:127.0.0.1:25565->25565
 ```
 
-`--tunnel` spec is `name=proto:LOCAL->REMOTE[;proxy=v1|v2]` (use REMOTE `0` for a
-server-assigned port).
+`--tunnel` spec is `name=proto:LOCAL->REMOTE[;proxy=v1|v2][;encrypted=true|false]` (use
+REMOTE `0` for a server-assigned port). The `encrypted` key also accepts `encrypt` or `tls`
+as aliases.
 
 ### TCP source IP forwarding
 
@@ -208,13 +211,14 @@ name = "minecraft"
 protocol = "tcp"
 local_addr = "127.0.0.1:25565"
 remote_port = 25565
+encrypted = false    # false = plaintext data, true = TLS data
 proxy_protocol = "v1" # off | v1 | v2
 ```
 
 Or from the CLI:
 
 ```sh
-porthole client ... --tunnel 'mc=tcp:127.0.0.1:25565->25565;proxy=v1'
+porthole client ... --tunnel 'mc=tcp:127.0.0.1:25565->25565;proxy=v1;encrypted=true'
 ```
 
 The web UI exposes the same setting as a TCP-only advanced option when adding a tunnel, and
@@ -292,7 +296,7 @@ min_port = 10000
 max_port = 20000
 
 # Address baked into connection codes. Use a Tailscale MagicDNS name or 100.x.y.z address
-# if clients should reach the control/data ingress only through Tailscale.
+# for the TLS control connection and encrypted TCP data channels.
 public_host = "relay.your-tailnet.ts.net"
 ```
 
@@ -316,9 +320,9 @@ Or, when joining from a connection code:
 porthole join porthole1_... --public-addr tunnels.example.com
 ```
 
-With this setup, porthole control traffic and on-demand data connections use Tailscale on
-`relay.your-tailnet.ts.net:7835`, while end users connect to public tunnel endpoints such as
-`tunnels.example.com:25565`.
+With this setup, porthole control traffic and encrypted TCP data channels use Tailscale on
+`relay.your-tailnet.ts.net:7835`, while end users and plaintext UDP data channels use public
+tunnel endpoints such as `tunnels.example.com:25565`.
 
 The exact firewall rules depend on your distro and provider, but the intent is:
 
@@ -343,6 +347,8 @@ optionally `22`.
 - The connection code contains the shared secret — treat it like a password.
 - Regenerating the server cert changes its fingerprint; existing codes/clients must re-pin.
 - The server only grants public ports inside its configured range.
+- Data channels default to plaintext. Set `encrypted = true` per tunnel when confidentiality
+  matters more than lowest latency.
 
 ## License
 

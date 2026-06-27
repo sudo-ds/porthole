@@ -20,14 +20,40 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::client::ClientShared;
-use crate::config::ProxyProtocol;
+use crate::config::{self, ProxyProtocol};
 use crate::net;
-use crate::protocol::{self, Prefixed, ServerMessage, ACCEPT_TIMEOUT};
-use crate::server::ServerTls;
+use crate::protocol::{self, ServerMessage, ACCEPT_TIMEOUT};
 
 /// Pending TCP accepts awaiting their data connection, keyed by connection id.
-pub type PendingMap = PendingMapFor<ServerTls>;
-pub type PendingMapFor<S> = Arc<DashMap<Uuid, oneshot::Sender<Prefixed<S>>>>;
+pub type PendingMap = Arc<DashMap<Uuid, PendingTcp>>;
+
+pub trait RelayIo: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> RelayIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+pub type BoxedRelayIo = Box<dyn RelayIo>;
+
+pub struct PendingTcp {
+    pub encrypted: bool,
+    pub data_auth: String,
+    pub tx: oneshot::Sender<BoxedRelayIo>,
+}
+
+pub struct ClientConn {
+    pub id: Uuid,
+    pub tunnel: String,
+    pub src_addr: Option<SocketAddr>,
+    pub dst_addr: Option<SocketAddr>,
+    pub encrypted: bool,
+    pub data_auth: Option<String>,
+}
+
+struct UserConn {
+    tunnel: String,
+    encrypted: bool,
+    src_addr: Option<SocketAddr>,
+    dst_addr: Option<SocketAddr>,
+}
 
 /// Per-direction splice buffer size. The default `copy_bidirectional` uses 8 KiB, which caps
 /// single-stream throughput on high bandwidth-delay links; 64 KiB lets bulk transfers fill the
@@ -38,6 +64,7 @@ const SPLICE_BUF: usize = 64 * 1024;
 pub async fn server_listener(
     listener: TcpListener,
     tunnel: String,
+    encrypted: bool,
     control_tx: mpsc::Sender<ServerMessage>,
     pending: PendingMap,
     cancel: CancellationToken,
@@ -55,9 +82,12 @@ pub async fn server_listener(
 
                 accept_user_conn(
                     user,
-                    tunnel.clone(),
-                    Some(peer),
-                    dst,
+                    UserConn {
+                        tunnel: tunnel.clone(),
+                        encrypted,
+                        src_addr: Some(peer),
+                        dst_addr: dst,
+                    },
                     control_tx.clone(),
                     pending.clone(),
                     cancel.clone(),
@@ -68,28 +98,35 @@ pub async fn server_listener(
     }
 }
 
-async fn accept_user_conn<User, Data>(
+async fn accept_user_conn<User>(
     user: User,
-    tunnel: String,
-    src_addr: Option<SocketAddr>,
-    dst_addr: Option<SocketAddr>,
+    conn: UserConn,
     control_tx: mpsc::Sender<ServerMessage>,
-    pending: PendingMapFor<Data>,
+    pending: PendingMap,
     cancel: CancellationToken,
 ) where
     User: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    Data: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let id = Uuid::new_v4();
-    let (tx, rx) = oneshot::channel::<Prefixed<Data>>();
-    pending.insert(id, tx);
+    let data_auth = config::gen_secret();
+    let (tx, rx) = oneshot::channel::<BoxedRelayIo>();
+    pending.insert(
+        id,
+        PendingTcp {
+            encrypted: conn.encrypted,
+            data_auth: data_auth.clone(),
+            tx,
+        },
+    );
 
     if control_tx
         .send(ServerMessage::NewConn {
             id,
-            tunnel,
-            src_addr,
-            dst_addr,
+            tunnel: conn.tunnel,
+            src_addr: conn.src_addr,
+            dst_addr: conn.dst_addr,
+            encrypted: conn.encrypted,
+            data_auth: (!conn.encrypted).then_some(data_auth),
         })
         .await
         .is_err()
@@ -129,28 +166,41 @@ async fn accept_user_conn<User, Data>(
 /// Client side: handle one `NewConn` by splicing a data conn to the local service.
 pub async fn client_handle_conn(
     shared: Arc<ClientShared>,
-    id: Uuid,
-    tunnel: String,
-    src_addr: Option<SocketAddr>,
-    dst_addr: Option<SocketAddr>,
+    conn: ClientConn,
     cancel: CancellationToken,
 ) {
-    let (local, proxy_protocol, counters) = match shared.status.get(&tunnel) {
+    let (local, proxy_protocol, counters) = match shared.status.get(&conn.tunnel) {
         Some(s) => (s.local_addr, s.proxy_protocol, s.counters.clone()),
         None => {
-            tracing::warn!("NewConn for unknown tunnel '{tunnel}'");
+            tracing::warn!("NewConn for unknown tunnel '{}'", conn.tunnel);
             return;
         }
     };
 
-    let wire = match crate::client::connect_data_wire(&shared, id).await {
-        Ok(w) => w,
-        Err(e) => {
-            tracing::warn!("opening data connection failed: {e:#}");
+    let mut data: BoxedRelayIo = if conn.encrypted {
+        match crate::client::connect_data_wire(&shared, conn.id).await {
+            Ok(w) => Box::new(protocol::into_raw(w)),
+            Err(e) => {
+                tracing::warn!("opening encrypted data connection failed: {e:#}");
+                return;
+            }
+        }
+    } else {
+        let Some(data_auth) = conn.data_auth else {
+            tracing::warn!(
+                "plaintext NewConn for '{}' is missing data_auth",
+                conn.tunnel
+            );
             return;
+        };
+        match crate::client::connect_plain_data_stream(&shared, conn.id, data_auth).await {
+            Ok(s) => Box::new(s),
+            Err(e) => {
+                tracing::warn!("opening plaintext data connection failed: {e:#}");
+                return;
+            }
         }
     };
-    let mut data = protocol::into_raw(wire);
 
     let mut local_stream = match TcpStream::connect(local).await {
         Ok(s) => s,
@@ -162,14 +212,20 @@ pub async fn client_handle_conn(
     net::set_keepalive(&local_stream);
 
     if !proxy_protocol.is_off() {
-        let (Some(src), Some(dst)) = (src_addr, dst_addr) else {
-            tracing::warn!("proxy protocol enabled for '{tunnel}' but source metadata is missing");
+        let (Some(src), Some(dst)) = (conn.src_addr, conn.dst_addr) else {
+            tracing::warn!(
+                "proxy protocol enabled for '{}' but source metadata is missing",
+                conn.tunnel
+            );
             return;
         };
         let header = match proxy_header(proxy_protocol, src, dst) {
             Ok(header) => header,
             Err(e) => {
-                tracing::warn!("proxy protocol header for '{tunnel}' could not be built: {e:#}");
+                tracing::warn!(
+                    "proxy protocol header for '{}' could not be built: {e:#}",
+                    conn.tunnel
+                );
                 return;
             }
         };
@@ -246,22 +302,26 @@ fn proxy_header_v2(src: SocketAddr, dst: SocketAddr) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    use crate::protocol::Prefixed;
     use bytes::BytesMut;
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use tokio::time::{timeout, Duration};
 
     #[tokio::test]
     async fn accepted_user_conn_splices_to_matching_data_conn_in_memory() {
         let cancel = CancellationToken::new();
-        let pending: PendingMapFor<DuplexStream> = Arc::new(DashMap::new());
+        let pending: PendingMap = Arc::new(DashMap::new());
         let (control_tx, mut control_rx) = mpsc::channel(1);
         let (mut public_side, server_side) = duplex(4096);
 
         accept_user_conn(
             server_side,
-            "mock-tunnel".into(),
-            Some("203.0.113.7:51820".parse().unwrap()),
-            Some("198.51.100.10:25565".parse().unwrap()),
+            UserConn {
+                tunnel: "mock-tunnel".into(),
+                encrypted: false,
+                src_addr: Some("203.0.113.7:51820".parse().unwrap()),
+                dst_addr: Some("198.51.100.10:25565".parse().unwrap()),
+            },
             control_tx,
             pending.clone(),
             cancel.clone(),
@@ -273,6 +333,8 @@ mod tests {
             tunnel,
             src_addr,
             dst_addr,
+            encrypted,
+            data_auth,
         } = control_rx.recv().await.unwrap()
         else {
             panic!("expected NewConn");
@@ -280,12 +342,15 @@ mod tests {
         assert_eq!(tunnel, "mock-tunnel");
         assert_eq!(src_addr, Some("203.0.113.7:51820".parse().unwrap()));
         assert_eq!(dst_addr, Some("198.51.100.10:25565".parse().unwrap()));
+        assert!(!encrypted);
+        assert!(data_auth.is_some());
         assert!(pending.contains_key(&id));
 
         let (mut client_data, server_data) = duplex(4096);
-        let (_, pending_tx) = pending.remove(&id).unwrap();
-        assert!(pending_tx
-            .send(Prefixed::new(BytesMut::new(), server_data))
+        let (_, pending_tcp) = pending.remove(&id).unwrap();
+        assert!(pending_tcp
+            .tx
+            .send(Box::new(Prefixed::new(BytesMut::new(), server_data)))
             .is_ok());
 
         public_side.write_all(b"from-public").await.unwrap();
@@ -310,15 +375,18 @@ mod tests {
     #[tokio::test]
     async fn accepted_user_conn_removes_pending_when_cancelled_before_data_conn() {
         let cancel = CancellationToken::new();
-        let pending: PendingMapFor<DuplexStream> = Arc::new(DashMap::new());
+        let pending: PendingMap = Arc::new(DashMap::new());
         let (control_tx, mut control_rx) = mpsc::channel(1);
         let (_public_side, server_side) = duplex(4096);
 
         accept_user_conn(
             server_side,
-            "mock-tunnel".into(),
-            None,
-            None,
+            UserConn {
+                tunnel: "mock-tunnel".into(),
+                encrypted: false,
+                src_addr: None,
+                dst_addr: None,
+            },
             control_tx,
             pending.clone(),
             cancel.clone(),

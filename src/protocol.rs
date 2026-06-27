@@ -10,10 +10,15 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{bail, ensure, Context as _, Result};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
+use hmac::{Hmac, Mac};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use uuid::Uuid;
@@ -33,6 +38,11 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
 pub const ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+pub const UDP_PLAINTEXT_KEEPALIVE: Duration = Duration::from_secs(5);
+/// Keep native UDP relay packets below the IPv6 minimum MTU without fragmentation.
+pub const UDP_PLAINTEXT_MAX_PACKET: usize = 1200;
+pub const UDP_PLAINTEXT_OVERHEAD: usize = 4 + 1 + 1 + 8 + 16;
+pub const UDP_PLAINTEXT_MAX_BODY: usize = UDP_PLAINTEXT_MAX_PACKET - UDP_PLAINTEXT_OVERHEAD;
 
 // ---------------------------------------------------------------------------
 // Protocol type
@@ -79,14 +89,19 @@ pub enum ClientMessage {
     /// First frame on a data connection: bearer token + the id this connection fulfils
     /// (a pending TCP accept's conn id, or a UDP tunnel's token).
     DataHello {
-        token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
         id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data_auth: Option<String>,
     },
     /// Request a public tunnel.
     Register {
         name: String,
         proto: Proto,
         remote_port: Option<u16>,
+        #[serde(default)]
+        encrypted: bool,
     },
     /// Remove a previously registered tunnel.
     Unregister {
@@ -109,7 +124,11 @@ pub enum ServerMessage {
         proto: Proto,
         public_addr: String,
         remote_port: u16,
+        #[serde(default)]
+        encrypted: bool,
         token: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        udp_auth_key: Option<String>,
     },
     /// A registration was refused (port out of range, already in use, ...).
     Rejected {
@@ -124,6 +143,10 @@ pub enum ServerMessage {
         src_addr: Option<SocketAddr>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dst_addr: Option<SocketAddr>,
+        #[serde(default)]
+        encrypted: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data_auth: Option<String>,
     },
     Heartbeat,
     Error {
@@ -238,6 +261,114 @@ pub fn decode_udp(buf: &[u8]) -> Result<(SocketAddr, &[u8])> {
 }
 
 // ---------------------------------------------------------------------------
+// Authenticated plaintext UDP data packets.
+// [magic "PTHU"][version u8][kind u8][seq u64 BE][body..][hmac16]
+// ---------------------------------------------------------------------------
+
+type HmacSha256 = Hmac<Sha256>;
+
+const UDP_PLAINTEXT_MAGIC: &[u8; 4] = b"PTHU";
+const UDP_PLAINTEXT_VERSION: u8 = 1;
+const UDP_PLAINTEXT_TAG: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlainUdpKind {
+    Hello,
+    Data,
+    Keepalive,
+}
+
+impl PlainUdpKind {
+    fn code(self) -> u8 {
+        match self {
+            Self::Hello => 1,
+            Self::Data => 2,
+            Self::Keepalive => 3,
+        }
+    }
+
+    fn from_code(code: u8) -> Result<Self> {
+        match code {
+            1 => Ok(Self::Hello),
+            2 => Ok(Self::Data),
+            3 => Ok(Self::Keepalive),
+            other => bail!("invalid plaintext udp packet kind {other}"),
+        }
+    }
+}
+
+pub fn encode_udp_auth_key(key: &[u8; 32]) -> String {
+    URL_SAFE_NO_PAD.encode(key)
+}
+
+pub fn decode_udp_auth_key(s: &str) -> Result<[u8; 32]> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(s.trim().as_bytes())
+        .context("udp auth key is not valid base64url")?;
+    ensure!(bytes.len() == 32, "udp auth key must be 32 bytes");
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    Ok(key)
+}
+
+pub fn encode_plain_udp(
+    kind: PlainUdpKind,
+    seq: u64,
+    body: &[u8],
+    key: &[u8; 32],
+) -> Option<Bytes> {
+    if body.len() > UDP_PLAINTEXT_MAX_BODY {
+        return None;
+    }
+
+    let mut out = BytesMut::with_capacity(UDP_PLAINTEXT_OVERHEAD + body.len());
+    out.put_slice(UDP_PLAINTEXT_MAGIC);
+    out.put_u8(UDP_PLAINTEXT_VERSION);
+    out.put_u8(kind.code());
+    out.put_u64(seq);
+    out.put_slice(body);
+
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(&out);
+    let tag = mac.finalize().into_bytes();
+    out.put_slice(&tag[..UDP_PLAINTEXT_TAG]);
+    Some(out.freeze())
+}
+
+pub fn decode_plain_udp<'a>(
+    packet: &'a [u8],
+    key: &[u8; 32],
+) -> Result<(PlainUdpKind, u64, &'a [u8])> {
+    ensure!(
+        packet.len() >= UDP_PLAINTEXT_OVERHEAD,
+        "short plaintext udp packet"
+    );
+    ensure!(
+        &packet[..4] == UDP_PLAINTEXT_MAGIC,
+        "bad plaintext udp magic"
+    );
+    ensure!(
+        packet[4] == UDP_PLAINTEXT_VERSION,
+        "bad plaintext udp version"
+    );
+
+    let tag_start = packet.len() - UDP_PLAINTEXT_TAG;
+    let (signed, tag) = packet.split_at(tag_start);
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(signed);
+    let expected = mac.finalize().into_bytes();
+    ensure!(
+        bool::from(expected[..UDP_PLAINTEXT_TAG].ct_eq(tag)),
+        "bad plaintext udp auth tag"
+    );
+
+    let kind = PlainUdpKind::from_code(packet[5])?;
+    let mut seq_bytes = [0u8; 8];
+    seq_bytes.copy_from_slice(&packet[6..14]);
+    Ok((kind, u64::from_be_bytes(seq_bytes), &packet[14..tag_start]))
+}
+
+// ---------------------------------------------------------------------------
 // Prefixed: hand a framed stream off to a raw byte splice without losing bytes
 // the codec already read past the last frame.
 // ---------------------------------------------------------------------------
@@ -338,24 +469,66 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_udp_packet_roundtrip_and_auth_rejects_tamper() {
+        let key = [7u8; 32];
+        let packet = encode_plain_udp(PlainUdpKind::Data, 42, b"hello", &key).unwrap();
+        let (kind, seq, body) = decode_plain_udp(&packet, &key).unwrap();
+        assert_eq!(kind, PlainUdpKind::Data);
+        assert_eq!(seq, 42);
+        assert_eq!(body, b"hello");
+
+        let mut tampered = packet.to_vec();
+        tampered[14] ^= 0x01;
+        assert!(decode_plain_udp(&tampered, &key).is_err());
+    }
+
+    #[test]
+    fn plaintext_udp_rejects_bad_magic_version_and_oversize() {
+        let key = [9u8; 32];
+        let packet = encode_plain_udp(PlainUdpKind::Keepalive, 0, b"", &key).unwrap();
+
+        let mut bad_magic = packet.to_vec();
+        bad_magic[0] = b'X';
+        assert!(decode_plain_udp(&bad_magic, &key).is_err());
+
+        let mut bad_version = packet.to_vec();
+        bad_version[4] = 2;
+        assert!(decode_plain_udp(&bad_version, &key).is_err());
+
+        let too_big = vec![0u8; UDP_PLAINTEXT_MAX_BODY + 1];
+        assert!(encode_plain_udp(PlainUdpKind::Data, 0, &too_big, &key).is_none());
+    }
+
+    #[test]
+    fn udp_auth_key_roundtrip() {
+        let key = [3u8; 32];
+        let text = encode_udp_auth_key(&key);
+        assert_eq!(decode_udp_auth_key(&text).unwrap(), key);
+        assert!(decode_udp_auth_key("nope").is_err());
+    }
+
+    #[test]
     fn message_json_roundtrip() {
         let msgs = vec![
             ClientMessage::Hello {
                 token: "secret".into(),
             },
             ClientMessage::DataHello {
-                token: "secret".into(),
+                token: Some("secret".into()),
                 id: Uuid::nil(),
+                data_auth: None,
             },
             ClientMessage::Register {
                 name: "mc".into(),
                 proto: Proto::Tcp,
                 remote_port: Some(25565),
+                encrypted: false,
             },
             ClientMessage::Register {
                 name: "g".into(),
                 proto: Proto::Udp,
                 remote_port: None,
+                encrypted: false,
             },
             ClientMessage::Unregister { name: "mc".into() },
             ClientMessage::Heartbeat,
@@ -371,7 +544,9 @@ mod tests {
             proto: Proto::Udp,
             public_addr: "203.0.113.7:25565".into(),
             remote_port: 25565,
+            encrypted: false,
             token: Some(Uuid::nil()),
+            udp_auth_key: None,
         };
         let j = serde_json::to_vec(&s).unwrap();
         let back: ServerMessage = serde_json::from_slice(&j).unwrap();
@@ -388,6 +563,8 @@ mod tests {
             tunnel: "mc".into(),
             src_addr: Some("203.0.113.7:51820".parse().unwrap()),
             dst_addr: Some("198.51.100.10:25565".parse().unwrap()),
+            encrypted: false,
+            data_auth: None,
         };
         send_msg(&mut wa, &sent).await.unwrap();
         let got: ServerMessage = recv_msg(&mut wb).await.unwrap();
