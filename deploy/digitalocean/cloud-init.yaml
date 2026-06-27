@@ -1,0 +1,46 @@
+#cloud-config
+package_update: true
+package_upgrade: false
+
+packages:
+  - ca-certificates
+  - curl
+  - git
+
+runcmd:
+  - |
+    set -eux
+
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+
+    . /etc/os-release
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${UBUNTU_CODENAME:-$VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list
+
+    apt-get update
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+    REPO_URL="https://github.com/sudo-ds/porthole.git"
+    INSTALL_DIR="/opt/porthole"
+    PUBLIC_HOST=""
+
+    if [ -z "$PUBLIC_HOST" ]; then
+      PUBLIC_HOST="$(curl -fsS --max-time 4 http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address || true)"
+    fi
+    if [ -z "$PUBLIC_HOST" ]; then
+      PUBLIC_HOST="$(curl -fsS --max-time 4 https://api.ipify.org || true)"
+    fi
+
+    git clone "$REPO_URL" "$INSTALL_DIR"
+    cd "$INSTALL_DIR"
+    bash ./scripts/setup-docker-server.sh --public-host "$PUBLIC_HOST"
+    docker compose pull
+    docker compose up -d
+
+final_message: |
+  Porthole Docker setup finished.
+  SSH in, then run:
+    cd /opt/porthole
+    docker compose logs -f porthole
+    docker compose run --rm porthole invite

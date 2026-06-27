@@ -3,6 +3,7 @@
 *.key
 *.pem
 porthole.env
+.env
 .claude/
 # local runtime configs (may contain the secret)
 /client.toml

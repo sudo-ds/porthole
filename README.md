@@ -297,6 +297,78 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 The simplest deploy: `git clone` on the VPS and `cargo build --release` there.
 
+## Deploy the server (Docker)
+
+For a fresh VPS, Docker is the easiest server path. The Compose template uses host networking
+because porthole binds one control port plus whatever public TCP/UDP tunnel ports clients
+request.
+
+```sh
+git clone https://github.com/sudo-ds/porthole.git
+cd porthole
+bash ./scripts/setup-docker-server.sh --public-host your.domain.or.ip
+docker compose pull
+docker compose up -d
+docker compose run --rm porthole invite
+```
+
+The setup script writes `.env` with a random `PORTHOLE_SECRET`, `chmod 600`s it, and defaults to:
+
+```dotenv
+PORTHOLE_CONTROL_PORT=7835
+PORTHOLE_MIN_PORT=10000
+PORTHOLE_MAX_PORT=20000
+PORTHOLE_LOG_LEVEL=info
+PORTHOLE_LOG_MODE=console
+```
+
+The container renders `/var/lib/porthole/server.toml` from those values on startup. The shared
+secret stays in `.env`; the TLS cert, key, generated server config, and optional file logs live in
+the `porthole-data` Docker volume. Back up both `.env` and that volume if you want existing
+connection codes to keep working after a move. Deleting the volume regenerates the TLS cert and
+invalidates old connection codes.
+
+Useful Docker commands:
+
+```sh
+docker compose logs -f porthole
+docker compose run --rm porthole invite
+docker compose pull && docker compose up -d
+```
+
+Open the control port and tunnel range in your provider firewall and on the host firewall. For
+the defaults:
+
+```sh
+ufw allow 7835/tcp
+ufw allow 10000:20000/tcp
+ufw allow 10000:20000/udp
+```
+
+The default image is `ghcr.io/sudo-ds/porthole:latest`. To pin a release or use a fork, add a
+`PORTHOLE_IMAGE=...` line to `.env`. The default container runs unprivileged, so public tunnel
+ports below `1024` are not supported unless you intentionally customize the container privileges.
+
+### DigitalOcean one-boot setup
+
+When creating an Ubuntu droplet, paste `deploy/digitalocean/cloud-init.yaml` into the
+DigitalOcean User Data / Startup Script box. If you are using a fork or a repository created from
+this template, edit `REPO_URL` in that file first. It installs Docker Engine from Docker's Ubuntu
+apt repository, clones the repo to `/opt/porthole`, creates `.env`, pulls the GHCR image, and
+starts the server.
+
+After the droplet finishes booting:
+
+```sh
+ssh root@your-droplet
+cd /opt/porthole
+docker compose logs -f porthole
+docker compose run --rm porthole invite
+```
+
+Also configure the DigitalOcean Cloud Firewall for `7835/tcp` and your chosen tunnel range for
+both TCP and UDP.
+
 ## Deploy the server (systemd)
 
 `scp` the binary to `/usr/local/bin/porthole`, then:

@@ -1,0 +1,11 @@
+.git
+.github
+target
+Logs
+*.crt
+*.key
+*.pem
+.env
+porthole.env
+porthole-server.toml
+porthole-client.toml

@@ -1,0 +1,19 @@
+services:
+  porthole:
+    image: ${PORTHOLE_IMAGE:-ghcr.io/sudo-ds/porthole:latest}
+    env_file:
+      - .env
+    network_mode: host
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - porthole-data:/var/lib/porthole
+
+volumes:
+  porthole-data:
