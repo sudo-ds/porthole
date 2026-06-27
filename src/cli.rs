@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -31,8 +31,84 @@ pub enum Command {
     Client(ClientArgs),
     /// Connect to a relay using a connection code from its operator (porthole1_...).
     Join(JoinArgs),
+    /// Install or uninstall porthole as a Windows service.
+    Service(ServiceArgs),
     /// Print a fresh random secret token (use it on both server and client).
     GenToken,
+}
+
+#[derive(Args, Debug)]
+pub struct ServiceArgs {
+    #[command(subcommand)]
+    pub command: ServiceCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ServiceCommand {
+    /// Install an auto-start Windows service for the server or client.
+    Install(ServiceInstallArgs),
+    /// Uninstall a Windows service installed by porthole.
+    Uninstall(ServiceUninstallArgs),
+    /// Internal entrypoint used by the Windows Service Control Manager.
+    #[command(hide = true)]
+    Run(ServiceRunArgs),
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ServiceKind {
+    Server,
+    Client,
+}
+
+#[derive(Args, Debug)]
+pub struct ServiceInstallArgs {
+    /// Which porthole process this service should run.
+    #[arg(value_enum)]
+    pub kind: ServiceKind,
+    /// Windows service name (default: porthole-server or porthole-client).
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Human-readable Windows service display name.
+    #[arg(long)]
+    pub display_name: Option<String>,
+    /// TOML config file the service should use.
+    #[arg(long, value_name = "FILE")]
+    pub config: Option<PathBuf>,
+    /// Directory porthole should use as its process working directory.
+    ///
+    /// Defaults to the directory containing this executable. If --config is omitted,
+    /// the config file defaults to porthole-server.toml or porthole-client.toml in this directory.
+    #[arg(long, value_name = "DIR")]
+    pub working_dir: Option<PathBuf>,
+    /// Start the service immediately after installing it.
+    #[arg(long)]
+    pub start: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ServiceUninstallArgs {
+    /// Which porthole service to uninstall.
+    #[arg(value_enum)]
+    pub kind: ServiceKind,
+    /// Windows service name (default: porthole-server or porthole-client).
+    #[arg(long)]
+    pub name: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ServiceRunArgs {
+    /// Windows service name registered with the Service Control Manager.
+    #[arg(long)]
+    pub name: String,
+    /// Which porthole process this service should run.
+    #[arg(long, value_enum)]
+    pub kind: ServiceKind,
+    /// TOML config file the service should use.
+    #[arg(long, value_name = "FILE")]
+    pub config: PathBuf,
+    /// Directory porthole should use as its process working directory.
+    #[arg(long, value_name = "DIR")]
+    pub working_dir: PathBuf,
 }
 
 #[derive(Args, Debug)]

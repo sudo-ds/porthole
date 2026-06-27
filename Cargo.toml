@@ -51,6 +51,7 @@ sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 enable-ansi-support = "0.2"
+windows-service = "0.8.1"
 
 [profile.release]
 strip = true

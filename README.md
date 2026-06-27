@@ -121,6 +121,8 @@ Use `--no-banner` for plain log output (e.g. under a service manager).
 porthole server [--public-host HOST] [--show-invite] [--config FILE] [--min-port N] [--max-port N]
 porthole client [--code CODE] [--config FILE] [--web-bind 127.0.0.1:4040]
 porthole join <CODE>
+porthole service install server|client [--config FILE] [--working-dir DIR] [--start]
+porthole service uninstall server|client
 porthole gen-token
 ```
 
@@ -135,6 +137,25 @@ porthole gen-token
   `--secret-file`, or a `secret = "..."` entry in the client config instead of `join`.
 - Config files (`porthole-server.toml`, `porthole-client.toml`) are created next to the binary
   and updated as you change tunnels. See `config/*.example.toml`.
+
+## Windows service
+
+Run these from an Administrator PowerShell or Command Prompt:
+
+```powershell
+porthole service install server --config C:\porthole\server.toml --working-dir C:\porthole --start
+porthole service install client --config C:\porthole\client.toml --working-dir C:\porthole --start
+```
+
+`--working-dir` defaults to the directory containing `porthole.exe`. If `--config` is omitted,
+the service uses `porthole-server.toml` or `porthole-client.toml` inside that working directory.
+Create the config file before using `--start`. The services are installed as `porthole-server` and
+`porthole-client`, set to start automatically, and can be removed with:
+
+```powershell
+porthole service uninstall server
+porthole service uninstall client
+```
 
 ## Advanced (manual setup, no connection code)
 

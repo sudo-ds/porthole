@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use porthole::cli::{Cli, Command};
-use porthole::{banner, client, config, install_crypto_provider, server, tui};
+use porthole::{banner, client, config, install_crypto_provider, server, service, tui};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -42,6 +42,11 @@ async fn main() -> Result<()> {
             banner::print(&format!("client · v{VERSION}"), show_banner);
             client::join(args).await
         }
+        Command::Service(args) => match args.command {
+            porthole::cli::ServiceCommand::Install(args) => service::install(args),
+            porthole::cli::ServiceCommand::Uninstall(args) => service::uninstall(args),
+            porthole::cli::ServiceCommand::Run(args) => service::run(args),
+        },
     }
 }
 

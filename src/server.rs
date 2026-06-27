@@ -65,6 +65,22 @@ struct Server {
 }
 
 pub async fn run(settings: ServerSettings) -> Result<()> {
+    let shutdown = CancellationToken::new();
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("shutting down");
+            shutdown.cancel();
+        });
+    }
+    run_with_shutdown(settings, shutdown).await
+}
+
+pub async fn run_with_shutdown(
+    settings: ServerSettings,
+    shutdown: CancellationToken,
+) -> Result<()> {
     let (acceptor, fingerprint) = tls::server_acceptor(&settings)?;
     let ingress = settings.ingress_addr()?;
 
@@ -89,16 +105,6 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
     tracing::info!("server certificate fingerprint (pin this on the client):");
     tracing::info!("    server_fingerprint = \"{fingerprint}\"");
     tracing::info!("get a shareable connection code with: porthole server --show-invite");
-
-    let shutdown = CancellationToken::new();
-    {
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("shutting down");
-            shutdown.cancel();
-        });
-    }
 
     loop {
         tokio::select! {

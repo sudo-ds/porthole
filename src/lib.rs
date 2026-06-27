@@ -12,6 +12,7 @@ pub mod invite;
 pub mod net;
 pub mod protocol;
 pub mod server;
+pub mod service;
 pub mod tcp;
 pub mod tls;
 pub mod tui;

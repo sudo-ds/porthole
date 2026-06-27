@@ -80,6 +80,21 @@ pub enum Command {
 }
 
 pub async fn run(settings: ClientSettings) -> Result<()> {
+    let shutdown = CancellationToken::new();
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            shutdown.cancel();
+        });
+    }
+    run_with_shutdown(settings, shutdown).await
+}
+
+pub async fn run_with_shutdown(
+    settings: ClientSettings,
+    shutdown: CancellationToken,
+) -> Result<()> {
     let connector = tls::client_connector(&settings.server_fingerprint)?;
     let server_name = tls::pinned_server_name();
     let web_bind = settings.web_bind.clone();
@@ -104,7 +119,7 @@ pub async fn run(settings: ClientSettings) -> Result<()> {
         min_port: AtomicU16::new(0),
         max_port: AtomicU16::new(0),
         started: Instant::now(),
-        shutdown: CancellationToken::new(),
+        shutdown,
     });
 
     tokio::spawn(command_processor(shared.clone(), cmd_rx));
@@ -117,14 +132,6 @@ pub async fn run(settings: ClientSettings) -> Result<()> {
             if let Err(e) = web::serve(shared, cmd_tx, bind).await {
                 tracing::error!("web UI failed: {e:#}");
             }
-        });
-    }
-
-    {
-        let shutdown = shared.shutdown.clone();
-        tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            shutdown.cancel();
         });
     }
 
