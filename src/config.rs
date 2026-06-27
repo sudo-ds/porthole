@@ -137,16 +137,16 @@ impl std::str::FromStr for ProxyProtocol {
 }
 
 pub fn validate_tunnel_config(t: &TunnelConfig) -> Result<()> {
-    if t.protocol == Proto::Udp && !t.proxy_protocol.is_off() {
-        bail!("proxy_protocol is only supported for tcp tunnels");
+    if t.protocol != Proto::Tcp && !t.proxy_protocol.is_off() {
+        bail!("proxy_protocol is only supported for tcp-only tunnels");
     }
     validate_udp_mtu(t.protocol, t.udp_mtu)?;
     Ok(())
 }
 
 pub fn validate_udp_mtu(proto: Proto, udp_mtu: Option<u16>) -> Result<()> {
-    if proto == Proto::Tcp && udp_mtu.is_some() {
-        bail!("udp_mtu is only supported for udp tunnels");
+    if !proto.has_udp() && udp_mtu.is_some() {
+        bail!("udp_mtu is only supported for udp-capable tunnels");
     }
     if let Some(mtu) = udp_mtu {
         if !(MIN_UDP_MTU..=MAX_UDP_MTU).contains(&mtu) {
@@ -157,10 +157,13 @@ pub fn validate_udp_mtu(proto: Proto, udp_mtu: Option<u16>) -> Result<()> {
 }
 
 pub fn resolved_udp_mtu(proto: Proto, udp_mtu: Option<u16>) -> Option<u16> {
-    (proto == Proto::Udp).then_some(udp_mtu.unwrap_or(DEFAULT_UDP_MTU))
+    proto
+        .has_udp()
+        .then_some(udp_mtu.unwrap_or(DEFAULT_UDP_MTU))
 }
 
 /// Parse a `name=proto:LOCAL->REMOTE[;proxy=v1|v2][;encrypted=true|false][;udp_mtu=N]` CLI spec.
+/// `proto` is `tcp`, `udp`, or `both`.
 pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelConfig> {
     let (name, rest) = spec
         .split_once('=')
@@ -548,6 +551,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_spec_both_accepts_udp_mtu() {
+        let t = parse_tunnel_spec("mc=both:127.0.0.1:25565->25565;udp_mtu=900").unwrap();
+        assert_eq!(t.protocol, Proto::Both);
+        assert_eq!(t.local_addr, "127.0.0.1:25565".parse().unwrap());
+        assert_eq!(t.remote_port, Some(25565));
+        assert_eq!(t.udp_mtu, Some(900));
+        assert_eq!(resolved_udp_mtu(t.protocol, t.udp_mtu), Some(900));
+    }
+
+    #[test]
     fn parse_spec_accepts_proxy_suffix() {
         let t = parse_tunnel_spec("mc=tcp:127.0.0.1:25565->25565;proxy=v2").unwrap();
         assert_eq!(t.proxy_protocol, ProxyProtocol::V2);
@@ -580,6 +593,7 @@ mod tests {
         assert!(parse_tunnel_spec("a=tcp:127.0.0.1:1->2;banana=v1").is_err());
         assert!(parse_tunnel_spec("a=tcp:127.0.0.1:1->2;encrypted=maybe").is_err());
         assert!(parse_tunnel_spec("a=udp:127.0.0.1:1->2;proxy=v1").is_err());
+        assert!(parse_tunnel_spec("a=both:127.0.0.1:1->2;proxy=v1").is_err());
         assert!(parse_tunnel_spec("a=tcp:127.0.0.1:1->2;udp_mtu=1200").is_err());
         assert!(parse_tunnel_spec("a=udp:127.0.0.1:1->2;udp_mtu=255").is_err());
         assert!(parse_tunnel_spec("a=udp:127.0.0.1:1->2;udp_mtu=65508").is_err());
@@ -639,6 +653,21 @@ proxy_protocol = "v1"
     }
 
     #[test]
+    fn validate_rejects_both_proxy_protocol() {
+        let t: TunnelConfig = toml::from_str(
+            r#"
+name = "both"
+protocol = "both"
+local_addr = "127.0.0.1:25565"
+remote_port = 25565
+proxy_protocol = "v1"
+"#,
+        )
+        .unwrap();
+        assert!(validate_tunnel_config(&t).is_err());
+    }
+
+    #[test]
     fn tunnel_udp_mtu_serializes_when_present() {
         let t: TunnelConfig = toml::from_str(
             r#"
@@ -651,6 +680,24 @@ udp_mtu = 900
         )
         .unwrap();
         assert_eq!(t.udp_mtu, Some(900));
+        assert!(validate_tunnel_config(&t).is_ok());
+        assert!(toml::to_string(&t).unwrap().contains("udp_mtu = 900"));
+    }
+
+    #[test]
+    fn tunnel_both_udp_mtu_serializes_when_present() {
+        let t: TunnelConfig = toml::from_str(
+            r#"
+name = "both"
+protocol = "both"
+local_addr = "127.0.0.1:25565"
+remote_port = 25565
+udp_mtu = 900
+"#,
+        )
+        .unwrap();
+        assert_eq!(t.udp_mtu, Some(900));
+        assert_eq!(resolved_udp_mtu(t.protocol, t.udp_mtu), Some(900));
         assert!(validate_tunnel_config(&t).is_ok());
         assert!(toml::to_string(&t).unwrap().contains("udp_mtu = 900"));
     }

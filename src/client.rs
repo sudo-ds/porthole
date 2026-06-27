@@ -509,7 +509,7 @@ fn apply_accepted(shared: &Arc<ClientShared>, conn_cancel: &CancellationToken, m
     }
     tracing::info!("tunnel '{name}' ({proto}) is live at {public}");
 
-    if proto == Proto::Udp {
+    if proto.has_udp() {
         if let Some(token) = token {
             let (local, counters) = match shared.status.get(&name) {
                 Some(s) => (s.local_addr, s.counters.clone()),
@@ -916,6 +916,52 @@ mod tests {
             public_endpoint(Some("2001:db8::1"), "100.64.0.1:7835", 25565),
             "[2001:db8::1]:25565"
         );
+    }
+
+    #[tokio::test]
+    async fn add_command_registers_both_tunnel_without_network() {
+        let tunnel = TunnelConfig {
+            name: "both".into(),
+            protocol: Proto::Both,
+            local_addr: "127.0.0.1:25565".parse().unwrap(),
+            remote_port: Some(25565),
+            enabled: true,
+            encrypted: true,
+            udp_mtu: Some(900),
+            proxy_protocol: ProxyProtocol::Off,
+        };
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let shared = test_shared(ClientFile::default(), None, Some(out_tx));
+        let assert_shared = shared.clone();
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let processor = tokio::spawn(command_processor(shared, cmd_rx));
+
+        cmd_tx.send(Command::Add(tunnel)).await.unwrap();
+        let msg = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            msg,
+            ClientMessage::Register {
+                name: "both".into(),
+                proto: Proto::Both,
+                remote_port: Some(25565),
+                encrypted: true,
+                udp_mtu: Some(900),
+            }
+        );
+        {
+            let status = assert_shared.status.get("both").unwrap();
+            assert_eq!(status.proto, Proto::Both);
+            assert_eq!(status.udp_mtu, Some(900));
+        }
+
+        drop(cmd_tx);
+        tokio::time::timeout(Duration::from_secs(1), processor)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

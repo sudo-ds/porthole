@@ -501,6 +501,78 @@ impl Server {
                         continue;
                     }
                 },
+                Proto::Both => {
+                    let listener = match net::bind_tcp(addr) {
+                        Ok(listener) => listener,
+                        Err(e) => {
+                            self.tunnels.remove(&port);
+                            cancel.cancel();
+                            tracing::debug!("bind tcp {addr}: {e}");
+                            continue;
+                        }
+                    };
+                    let socket = match net::bind_udp(addr) {
+                        Ok(socket) => Arc::new(socket),
+                        Err(e) => {
+                            self.tunnels.remove(&port);
+                            cancel.cancel();
+                            tracing::debug!("bind udp {addr}: {e}");
+                            continue;
+                        }
+                    };
+
+                    let token = Uuid::new_v4();
+                    let udp_auth_key = if encrypted {
+                        self.udp_pending.insert(
+                            token,
+                            PendingUdp {
+                                socket: socket.clone(),
+                                port,
+                                session: session.id,
+                                cancel: cancel.clone(),
+                            },
+                        );
+                        None
+                    } else {
+                        let mut key = [0u8; 32];
+                        rand::thread_rng().fill_bytes(&mut key);
+                        tokio::spawn(udp::server_plain_forward(
+                            socket.clone(),
+                            token,
+                            key,
+                            resolved_udp_mtu.unwrap_or(protocol::DEFAULT_UDP_MTU),
+                            cancel.clone(),
+                        ));
+                        Some(protocol::encode_udp_auth_key(&key))
+                    };
+
+                    tokio::spawn(tcp::server_listener(
+                        listener,
+                        name.clone(),
+                        encrypted,
+                        tx.clone(),
+                        self.pending.clone(),
+                        cancel.clone(),
+                    ));
+                    session.ports.push(port);
+                    if encrypted {
+                        session.udp_tokens.push(token);
+                    }
+                    tracing::info!("tunnel '{name}' (both) -> public port {port}");
+                    let _ = tx
+                        .send(ServerMessage::Accepted {
+                            name,
+                            proto,
+                            public_addr,
+                            remote_port: port,
+                            encrypted,
+                            token: Some(token),
+                            udp_auth_key,
+                            udp_mtu: resolved_udp_mtu,
+                        })
+                        .await;
+                    return;
+                }
             }
         }
 

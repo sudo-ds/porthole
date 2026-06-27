@@ -29,9 +29,10 @@ directory = "Logs"
 max_files = 14      # 0 disables pruning
 
 # Each tunnel exposes a local service on a public port of the server.
+# protocol can be "tcp", "udp", or "both"; "both" binds TCP and UDP to the same public port.
 # remote_port is optional (omit or 0 => the server assigns one).
 # encrypted defaults to false for the data channel. Set true to wrap data in TLS.
-# UDP tunnels can set udp_mtu (default 1200, range 256-65507) for plaintext fragmentation.
+# UDP-capable tunnels can set udp_mtu (default 1200, range 256-65507) for plaintext fragmentation.
 [[tunnels]]
 name = "minecraft"
 protocol = "tcp"
@@ -39,6 +40,7 @@ local_addr = "127.0.0.1:25565"
 remote_port = 25565
 encrypted = false
 # Optional TCP-only source IP forwarding for services that support PROXY protocol.
+# Not available when protocol is "udp" or "both".
 # proxy_protocol = "v1"   # off | v1 | v2
 
 [[tunnels]]

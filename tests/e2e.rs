@@ -191,6 +191,39 @@ async fn udp_echo() -> SocketAddr {
     addr
 }
 
+async fn both_echo() -> SocketAddr {
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let udp = UdpSocket::bind(addr).await.unwrap();
+
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = tcp.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match s.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if s.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    tokio::spawn(async move {
+        let mut buf = [0u8; 65535];
+        while let Ok((n, peer)) = udp.recv_from(&mut buf).await {
+            let _ = udp.send_to(&buf[..n], peer).await;
+        }
+    });
+
+    addr
+}
+
 fn server_settings(ingress: u16, public: u16, cert: PathBuf, key: PathBuf) -> ServerSettings {
     ServerSettings {
         bind_addr: "127.0.0.1".into(),
@@ -255,6 +288,23 @@ async fn connect_retry(addr: SocketAddr) -> TcpStream {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("relay never came up at {addr}");
+}
+
+async fn assert_udp_roundtrip(public_addr: SocketAddr, payload: &[u8]) {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut buf = vec![0u8; 65_535];
+    let mut got: Option<Vec<u8>> = None;
+    for _ in 0..100 {
+        let _ = sock.send_to(payload, public_addr).await;
+        match tokio::time::timeout(Duration::from_millis(200), sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) => {
+                got = Some(buf[..n].to_vec());
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    assert_eq!(got.as_deref(), Some(payload));
 }
 
 async fn connect_fails_for(addr: SocketAddr, attempts: usize) -> bool {
@@ -734,6 +784,62 @@ async fn udp_encrypted_large_datagram_roundtrip() {
         }
     }
     assert_eq!(got.as_deref(), Some(payload.as_slice()));
+}
+
+#[tokio::test]
+#[ignore = "uses real loopback sockets; run explicitly for relay smoke testing"]
+async fn both_tunnel_roundtrip() {
+    install();
+    let echo = both_echo().await;
+    let (ingress, public) = (free_port(), free_port());
+    let tunnel = TunnelConfig {
+        name: "both".into(),
+        protocol: Proto::Both,
+        local_addr: echo,
+        remote_port: Some(public),
+        enabled: true,
+        encrypted: false,
+        udp_mtu: None,
+        proxy_protocol: ProxyProtocol::Off,
+    };
+    start_relay(ingress, public, "both", tunnel);
+
+    let public_addr: SocketAddr = format!("127.0.0.1:{public}").parse().unwrap();
+    let mut tcp = connect_retry(public_addr).await;
+    tcp.write_all(b"both-tcp").await.unwrap();
+    let mut buf = [0u8; 8];
+    tcp.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"both-tcp");
+
+    assert_udp_roundtrip(public_addr, b"both-udp").await;
+}
+
+#[tokio::test]
+#[ignore = "uses real loopback sockets; run explicitly for relay smoke testing"]
+async fn both_tunnel_encrypted_roundtrip() {
+    install();
+    let echo = both_echo().await;
+    let (ingress, public) = (free_port(), free_port());
+    let tunnel = TunnelConfig {
+        name: "both".into(),
+        protocol: Proto::Both,
+        local_addr: echo,
+        remote_port: Some(public),
+        enabled: true,
+        encrypted: true,
+        udp_mtu: None,
+        proxy_protocol: ProxyProtocol::Off,
+    };
+    start_relay(ingress, public, "both-encrypted", tunnel);
+
+    let public_addr: SocketAddr = format!("127.0.0.1:{public}").parse().unwrap();
+    let mut tcp = connect_retry(public_addr).await;
+    tcp.write_all(b"both-tls").await.unwrap();
+    let mut buf = [0u8; 8];
+    tcp.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"both-tls");
+
+    assert_udp_roundtrip(public_addr, b"both-udp-tls").await;
 }
 
 #[tokio::test]

@@ -16,7 +16,7 @@ A simple, self-hosted TCP/UDP tunneling & relay — a tiny alternative to playit
 `bore` that **you** run. Expose a service on a machine behind NAT (no port forwarding) to the
 public internet through a server you control (e.g. a $5 VPS).
 
-- **TCP and UDP** tunnels
+- **TCP, UDP, and same-port TCP+UDP** tunnels
 - Optional TCP source IP forwarding with **PROXY protocol v1/v2**
 - **Share one connection code** — no certs, fingerprints, or config files to hand-edit
 - **Live terminal dashboard** (logo + stats + logs) and an **interactive web UI**
@@ -93,6 +93,9 @@ and relays public traffic back over data channels the client opened.
   Large plaintext datagrams are fragmented/reassembled between the relay and client according
   to `udp_mtu` (default `1200`). Set `encrypted = true` to use the compatibility path that
   multiplexes UDP over TLS/TCP.
+- **Both** — for services that bind TCP and UDP on the same port, set `protocol = "both"`.
+  The relay binds both public sockets on one port and uses the same `encrypted` setting for
+  both halves. PROXY protocol is not available in this mode.
 - **Security** — control traffic is always TLS. The server uses a self-signed certificate; its
   fingerprint travels inside the connection code, so the client pins it (no CA or domain needed).
   A shared token (also in the code) authenticates the client. Plain data channels are not
@@ -106,7 +109,7 @@ On an interactive terminal the client shows a live dashboard:
        .-"""""-.
      .'  o o o  '.        ... (purple logo) ...
        '-.....-'
-  client · v0.5.1
+  client · v0.5.2
 
   ● connected to 10xdev.sk:7835    public ports 1024-65535
 
@@ -199,8 +202,8 @@ PORTHOLE_SECRET=... porthole client \
 `--tunnel` spec is
 `name=proto:LOCAL->REMOTE[;proxy=v1|v2][;encrypted=true|false][;udp_mtu=N]` (use REMOTE `0`
 for a server-assigned port). The `encrypted` key also accepts `encrypt` or `tls` as aliases.
-For UDP tunnels, `udp_mtu` also accepts `mtu`; it defaults to `1200` and must be between
-`256` and `65507`.
+`proto` is `tcp`, `udp`, or `both`. For UDP-capable tunnels, `udp_mtu` also accepts `mtu`;
+it defaults to `1200` and must be between `256` and `65507`.
 
 ### TCP source IP forwarding
 
@@ -226,18 +229,18 @@ porthole client ... --tunnel 'mc=tcp:127.0.0.1:25565->25565;proxy=v1;encrypted=t
 ```
 
 The web UI exposes the same setting as a TCP-only advanced option when adding a tunnel, and
-shows a PROXY badge for tunnels using it.
+shows a PROXY badge for tunnels using it. `protocol = "both"` cannot use PROXY protocol.
 
 Only enable this if the upstream service is configured to accept PROXY protocol. Incompatible
 servers will receive the PROXY header before the normal game/application traffic and will often
 drop the connection. Also make sure the upstream service only accepts PROXY protocol from the
 trusted porthole client address, such as `127.0.0.1` or a private LAN IP; otherwise direct
-callers could spoof client IPs by sending their own PROXY header. UDP tunnels do not support
-this option.
+callers could spoof client IPs by sending their own PROXY header. UDP and both-protocol tunnels
+do not support this option.
 
 ### UDP MTU and fragmentation
 
-Plaintext UDP tunnels (`encrypted = false`) use authenticated native UDP packets between the
+Plaintext UDP-capable tunnels (`encrypted = false`) use authenticated native UDP packets between the
 relay and client. If the encoded datagram is larger than `udp_mtu`, porthole fragments it into
 multiple authenticated relay packets and reassembles it on the other side. `udp_mtu` is the
 maximum porthole UDP packet payload sent on the socket, excluding outer IP/UDP headers.
@@ -252,8 +255,8 @@ encrypted = false
 udp_mtu = 1200      # default; valid range 256-65507
 ```
 
-Encrypted UDP tunnels (`encrypted = true`) keep the compatibility path that multiplexes UDP
-over TLS/TCP, so `udp_mtu` is reported but not used by that data channel.
+Encrypted UDP-capable tunnels (`encrypted = true`) keep the compatibility path that multiplexes
+UDP over TLS/TCP, so `udp_mtu` is reported but not used by that data channel.
 
 ## Build
 

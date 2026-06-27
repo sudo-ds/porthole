@@ -60,6 +60,17 @@ pub const UDP_PLAINTEXT_MAX_ENCAPSULATED: usize = 65_535 + 19;
 pub enum Proto {
     Tcp,
     Udp,
+    Both,
+}
+
+impl Proto {
+    pub fn has_tcp(self) -> bool {
+        matches!(self, Proto::Tcp | Proto::Both)
+    }
+
+    pub fn has_udp(self) -> bool {
+        matches!(self, Proto::Udp | Proto::Both)
+    }
 }
 
 impl std::fmt::Display for Proto {
@@ -67,6 +78,7 @@ impl std::fmt::Display for Proto {
         match self {
             Proto::Tcp => write!(f, "tcp"),
             Proto::Udp => write!(f, "udp"),
+            Proto::Both => write!(f, "both"),
         }
     }
 }
@@ -77,7 +89,8 @@ impl std::str::FromStr for Proto {
         match s.to_ascii_lowercase().as_str() {
             "tcp" => Ok(Proto::Tcp),
             "udp" => Ok(Proto::Udp),
-            other => bail!("invalid protocol {other:?} (expected `tcp` or `udp`)"),
+            "both" => Ok(Proto::Both),
+            other => bail!("invalid protocol {other:?} (expected `tcp`, `udp`, or `both`)"),
         }
     }
 }
@@ -94,7 +107,7 @@ pub enum ClientMessage {
         token: String,
     },
     /// First frame on a data connection: bearer token + the id this connection fulfils
-    /// (a pending TCP accept's conn id, or a UDP tunnel's token).
+    /// (a pending TCP accept's conn id, or a UDP-capable tunnel's token).
     DataHello {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
@@ -127,7 +140,7 @@ pub enum ServerMessage {
         min_port: u16,
         max_port: u16,
     },
-    /// A tunnel was granted. `token` (UDP only) is the capability for its data channel.
+    /// A tunnel was granted. `token` (UDP-capable tunnels only) is the capability for its data channel.
     Accepted {
         name: String,
         proto: Proto,
@@ -515,6 +528,19 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proto_both_parses_displays_and_serializes() {
+        let proto: Proto = "both".parse().unwrap();
+        assert_eq!(proto, Proto::Both);
+        assert!(proto.has_tcp());
+        assert!(proto.has_udp());
+        assert_eq!(proto.to_string(), "both");
+
+        let json = serde_json::to_string(&proto).unwrap();
+        assert_eq!(json, "\"both\"");
+        assert_eq!(serde_json::from_str::<Proto>(&json).unwrap(), Proto::Both);
+    }
 
     #[test]
     fn udp_roundtrip_v4() {

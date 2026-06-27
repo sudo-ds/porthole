@@ -136,7 +136,9 @@ async fn add_tunnel(State(st): State<AppState>, Json(req): Json<AddRequest>) -> 
     }
     let proto: Proto = match req.proto.parse() {
         Ok(p) => p,
-        Err(_) => return (StatusCode::BAD_REQUEST, "proto must be tcp or udp").into_response(),
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, "proto must be tcp, udp, or both").into_response()
+        }
     };
     let local_addr = match parse_local_addr(&req.local) {
         Ok(a) => a,
