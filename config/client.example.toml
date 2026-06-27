@@ -9,6 +9,9 @@ server_fingerprint = "sha256:REPLACE_WITH_SERVER_FINGERPRINT"
 # Local web UI (loopback only — do not expose this).
 web_bind = "127.0.0.1:4040"
 
+# Temporarily pause all tunnels without changing each tunnel's enabled state.
+tunnels_paused = false
+
 # Shared secret. Prefer PORTHOLE_SECRET / --secret-file; uncomment to set inline.
 # secret = "CHANGE_ME"   # must match the server
 

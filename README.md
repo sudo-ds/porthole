@@ -101,7 +101,7 @@ On an interactive terminal the client shows a live dashboard:
        .-"""""-.
      .'  o o o  '.        ... (purple logo) ...
        '-.....-'
-  client · v0.1.0
+  client · v0.2.0
 
   ● connected to 10xdev.sk:7835    public ports 1024-65535
 
@@ -113,6 +113,8 @@ On an interactive terminal the client shows a live dashboard:
 ```
 
 The web UI at `http://127.0.0.1:4040` shows the same and lets you add/remove/toggle tunnels.
+It can also pause all tunnels at once. Pause is a persisted global hold: individual tunnel
+`enabled` values stay unchanged, and unpause restores only the tunnels that were enabled.
 Use `--no-banner` for plain log output (e.g. under a service manager).
 
 ## Configuration & CLI
@@ -136,7 +138,7 @@ porthole gen-token
   If you need to override the secret manually, use `porthole client` with `PORTHOLE_SECRET`,
   `--secret-file`, or a `secret = "..."` entry in the client config instead of `join`.
 - Config files (`porthole-server.toml`, `porthole-client.toml`) are created next to the binary
-  and updated as you change tunnels. See `config/*.example.toml`.
+  and updated as you change tunnels or pause/unpause them. See `config/*.example.toml`.
 
 ## Windows service
 

@@ -64,6 +64,7 @@ pub struct ClientShared {
     /// Sender into the current control connection's writer, if connected.
     pub out: Mutex<Option<mpsc::Sender<ClientMessage>>>,
     pub status: DashMap<String, TunnelStatus>,
+    pub tunnels_paused: AtomicBool,
     pub connected: AtomicBool,
     /// Allowed public-port range advertised by the server (0 = not yet known).
     pub min_port: AtomicU16,
@@ -77,6 +78,7 @@ pub enum Command {
     Add(TunnelConfig),
     Remove(String),
     SetEnabled(String, bool),
+    SetPaused(bool),
 }
 
 pub async fn run(settings: ClientSettings) -> Result<()> {
@@ -115,6 +117,7 @@ pub async fn run_with_shutdown(
         file: Mutex::new(settings.file.clone()),
         out: Mutex::new(None),
         status,
+        tunnels_paused: AtomicBool::new(settings.file.tunnels_paused),
         connected: AtomicBool::new(false),
         min_port: AtomicU16::new(0),
         max_port: AtomicU16::new(0),
@@ -361,14 +364,14 @@ async fn connect_and_run(shared: &Arc<ClientShared>) -> Result<()> {
         });
     }
 
-    // Register all enabled tunnels.
+    // Register all effectively enabled tunnels.
     let enabled: Vec<TunnelConfig> = shared
         .file
         .lock()
         .unwrap()
         .tunnels
         .iter()
-        .filter(|t| t.enabled)
+        .filter(|t| effective_enabled(shared, t))
         .cloned()
         .collect();
     for t in &enabled {
@@ -524,16 +527,8 @@ async fn command_processor(shared: Arc<ClientShared>, mut cmd_rx: mpsc::Receiver
                     f.tunnels.push(t.clone());
                     persist(&shared, &f);
                 }
-                if t.enabled {
-                    send_if_connected(
-                        &shared,
-                        ClientMessage::Register {
-                            name: t.name.clone(),
-                            proto: t.protocol,
-                            remote_port: t.remote_port,
-                        },
-                    )
-                    .await;
+                if effective_enabled(&shared, &t) {
+                    register_tunnel(&shared, &t).await;
                 }
                 tracing::info!("added tunnel '{}'", t.name);
             }
@@ -559,25 +554,78 @@ async fn command_processor(shared: Arc<ClientShared>, mut cmd_rx: mpsc::Receiver
                 };
                 if let Some(t) = found {
                     ensure_status(&shared, &t);
-                    if enabled {
-                        send_if_connected(
-                            &shared,
-                            ClientMessage::Register {
-                                name: name.clone(),
-                                proto: t.protocol,
-                                remote_port: t.remote_port,
-                            },
-                        )
-                        .await;
+                    if effective_enabled(&shared, &t) {
+                        register_tunnel(&shared, &t).await;
                     } else {
-                        if let Some(s) = shared.status.get(&name) {
-                            s.up.store(false, Relaxed);
-                        }
-                        send_if_connected(&shared, ClientMessage::Unregister { name }).await;
+                        mark_tunnel_down(&shared, &name);
+                        unregister_tunnel(&shared, &name).await;
                     }
                 }
             }
+            Command::SetPaused(paused) => {
+                let enabled = {
+                    let mut f = shared.file.lock().unwrap();
+                    if f.tunnels_paused == paused {
+                        Vec::new()
+                    } else {
+                        f.tunnels_paused = paused;
+                        shared.tunnels_paused.store(paused, Relaxed);
+                        let enabled: Vec<TunnelConfig> =
+                            f.tunnels.iter().filter(|t| t.enabled).cloned().collect();
+                        persist(&shared, &f);
+                        enabled
+                    }
+                };
+                if enabled.is_empty() {
+                    continue;
+                }
+                if paused {
+                    for t in &enabled {
+                        mark_tunnel_down(&shared, &t.name);
+                        unregister_tunnel(&shared, &t.name).await;
+                    }
+                    tracing::info!("paused all tunnels");
+                } else {
+                    for t in &enabled {
+                        ensure_status(&shared, t);
+                        register_tunnel(&shared, t).await;
+                    }
+                    tracing::info!("unpaused tunnels");
+                }
+            }
         }
+    }
+}
+
+fn effective_enabled(shared: &ClientShared, t: &TunnelConfig) -> bool {
+    t.enabled && !shared.tunnels_paused.load(Relaxed)
+}
+
+async fn register_tunnel(shared: &Arc<ClientShared>, t: &TunnelConfig) {
+    send_if_connected(
+        shared,
+        ClientMessage::Register {
+            name: t.name.clone(),
+            proto: t.protocol,
+            remote_port: t.remote_port,
+        },
+    )
+    .await;
+}
+
+async fn unregister_tunnel(shared: &Arc<ClientShared>, name: &str) {
+    send_if_connected(
+        shared,
+        ClientMessage::Unregister {
+            name: name.to_string(),
+        },
+    )
+    .await;
+}
+
+fn mark_tunnel_down(shared: &ClientShared, name: &str) {
+    if let Some(s) = shared.status.get(name) {
+        s.up.store(false, Relaxed);
     }
 }
 

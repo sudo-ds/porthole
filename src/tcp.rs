@@ -61,18 +61,28 @@ pub async fn server_listener(
                 }
 
                 let pending = pending.clone();
+                let splice_cancel = cancel.clone();
                 tokio::spawn(async move {
-                    match tokio::time::timeout(ACCEPT_TIMEOUT, rx).await {
-                        Ok(Ok(mut data)) => {
-                            let mut user = user;
-                            let _ = tokio::io::copy_bidirectional_with_sizes(
-                                &mut user, &mut data, SPLICE_BUF, SPLICE_BUF,
-                            )
-                            .await;
-                        }
-                        _ => {
-                            // Timed out or the data conn never came: drop the pending slot.
+                    tokio::select! {
+                        _ = splice_cancel.cancelled() => {
                             pending.remove(&id);
+                        }
+                        r = tokio::time::timeout(ACCEPT_TIMEOUT, rx) => {
+                            match r {
+                                Ok(Ok(mut data)) => {
+                                    let mut user = user;
+                                    tokio::select! {
+                                        _ = splice_cancel.cancelled() => {}
+                                        _ = tokio::io::copy_bidirectional_with_sizes(
+                                            &mut user, &mut data, SPLICE_BUF, SPLICE_BUF,
+                                        ) => {}
+                                    }
+                                }
+                                _ => {
+                                    // Timed out or the data conn never came: drop the pending slot.
+                                    pending.remove(&id);
+                                }
+                            }
                         }
                     }
                 });

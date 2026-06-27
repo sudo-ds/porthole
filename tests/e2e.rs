@@ -2,7 +2,7 @@
 //! and push real bytes through the relay.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use porthole::config::{ClientFile, ClientSettings, ServerSettings, TunnelConfig};
@@ -29,6 +29,14 @@ fn temp_paths(tag: &str) -> (PathBuf, PathBuf) {
     let _ = std::fs::remove_file(dir.join("c.crt"));
     let _ = std::fs::remove_file(dir.join("c.key"));
     (dir.join("c.crt"), dir.join("c.key"))
+}
+
+fn temp_client_config(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("porthole-e2e-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("client.toml");
+    let _ = std::fs::remove_file(&path);
+    path
 }
 
 async fn tcp_echo() -> SocketAddr {
@@ -80,14 +88,33 @@ fn server_settings(ingress: u16, public: u16, cert: PathBuf, key: PathBuf) -> Se
 }
 
 fn client_settings(ingress: u16, fingerprint: String, tunnel: TunnelConfig) -> ClientSettings {
+    client_settings_with(
+        ingress,
+        fingerprint,
+        vec![tunnel],
+        "127.0.0.1:0".into(),
+        None,
+        false,
+    )
+}
+
+fn client_settings_with(
+    ingress: u16,
+    fingerprint: String,
+    tunnels: Vec<TunnelConfig>,
+    web_bind: String,
+    config_path: Option<PathBuf>,
+    tunnels_paused: bool,
+) -> ClientSettings {
     ClientSettings {
         server_addr: format!("127.0.0.1:{ingress}"),
         server_fingerprint: fingerprint,
-        web_bind: "127.0.0.1:0".into(),
+        web_bind,
         secret: "test-secret".into(),
-        config_path: None,
+        config_path,
         file: ClientFile {
-            tunnels: vec![tunnel],
+            tunnels_paused,
+            tunnels,
             ..Default::default()
         },
     }
@@ -110,6 +137,85 @@ async fn connect_retry(addr: SocketAddr) -> TcpStream {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("relay never came up at {addr}");
+}
+
+async fn connect_fails_for(addr: SocketAddr, attempts: usize) -> bool {
+    for _ in 0..attempts {
+        if TcpStream::connect(addr).await.is_ok() {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    true
+}
+
+async fn http_request(addr: SocketAddr, method: &str, path: &str) -> Option<String> {
+    let mut s = TcpStream::connect(addr).await.ok()?;
+    let req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    s.write_all(req.as_bytes()).await.ok()?;
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+    Some(String::from_utf8_lossy(&buf).to_string())
+}
+
+async fn post_ok(addr: SocketAddr, path: &str) {
+    let resp = http_request(addr, "POST", path)
+        .await
+        .expect("web response");
+    assert!(resp.starts_with("HTTP/1.1 200"), "response was: {resp}");
+}
+
+async fn wait_for_status(
+    addr: SocketAddr,
+    pred: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    for _ in 0..100 {
+        if let Some(resp) = http_request(addr, "GET", "/api/status").await {
+            if let Some((_, body)) = resp.split_once("\r\n\r\n") {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+                    if pred(&value) {
+                        return value;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("web status did not reach expected state");
+}
+
+async fn wait_for_config_paused(path: &Path, paused: bool) {
+    for _ in 0..100 {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(file) = toml::from_str::<ClientFile>(&text) {
+                if file.tunnels_paused == paused {
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("config did not persist tunnels_paused = {paused}");
+}
+
+async fn assert_tcp_dropped(mut conn: TcpStream) {
+    let mut one = [0u8; 1];
+    for _ in 0..30 {
+        match tokio::time::timeout(Duration::from_millis(100), conn.read(&mut one)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => return,
+            Ok(Ok(_)) => {}
+            Err(_) => {
+                if conn.write_all(b"x").await.is_err() {
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("active TCP connection stayed open after pause");
 }
 
 #[tokio::test]
@@ -139,6 +245,118 @@ async fn tcp_tunnel_roundtrip() {
         conn.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf, msg);
     }
+}
+
+#[tokio::test]
+async fn paused_client_does_not_register_enabled_tunnels() {
+    install();
+    let echo = tcp_echo().await;
+    let (ingress, public, web) = (free_port(), free_port(), free_port());
+    let (cert, key) = temp_paths("paused-start");
+    let ss = server_settings(ingress, public, cert, key);
+    let (_acceptor, fingerprint) = tls::server_acceptor(&ss).expect("generate cert");
+    tokio::spawn(server::run(ss));
+
+    let tunnel = TunnelConfig {
+        name: "t".into(),
+        protocol: Proto::Tcp,
+        local_addr: echo,
+        remote_port: Some(public),
+        enabled: true,
+    };
+    tokio::spawn(client::run(client_settings_with(
+        ingress,
+        fingerprint,
+        vec![tunnel],
+        format!("127.0.0.1:{web}"),
+        None,
+        true,
+    )));
+
+    let web_addr: SocketAddr = format!("127.0.0.1:{web}").parse().unwrap();
+    wait_for_status(web_addr, |st| {
+        st["connected"].as_bool() == Some(true) && st["paused"].as_bool() == Some(true)
+    })
+    .await;
+
+    let public_addr: SocketAddr = format!("127.0.0.1:{public}").parse().unwrap();
+    assert!(connect_fails_for(public_addr, 10).await);
+}
+
+#[tokio::test]
+async fn web_pause_persists_drops_active_tcp_and_unpause_restores_enabled_only() {
+    install();
+    let echo = tcp_echo().await;
+    let (ingress, enabled_port, disabled_port, web) =
+        (free_port(), free_port(), free_port(), free_port());
+    let (cert, key) = temp_paths("web-pause");
+    let min_port = enabled_port.min(disabled_port);
+    let max_port = enabled_port.max(disabled_port);
+    let ss = ServerSettings {
+        bind_addr: "127.0.0.1".into(),
+        control_port: ingress,
+        secret: "test-secret".into(),
+        min_port,
+        max_port,
+        cert_path: cert,
+        key_path: key,
+        public_host: None,
+    };
+    let (_acceptor, fingerprint) = tls::server_acceptor(&ss).expect("generate cert");
+    tokio::spawn(server::run(ss));
+
+    let enabled = TunnelConfig {
+        name: "enabled".into(),
+        protocol: Proto::Tcp,
+        local_addr: echo,
+        remote_port: Some(enabled_port),
+        enabled: true,
+    };
+    let disabled = TunnelConfig {
+        name: "disabled".into(),
+        protocol: Proto::Tcp,
+        local_addr: echo,
+        remote_port: Some(disabled_port),
+        enabled: false,
+    };
+    let config_path = temp_client_config("web-pause");
+    tokio::spawn(client::run(client_settings_with(
+        ingress,
+        fingerprint,
+        vec![enabled, disabled],
+        format!("127.0.0.1:{web}"),
+        Some(config_path.clone()),
+        false,
+    )));
+
+    let web_addr: SocketAddr = format!("127.0.0.1:{web}").parse().unwrap();
+    wait_for_status(web_addr, |st| {
+        st["connected"].as_bool() == Some(true) && st["paused"].as_bool() == Some(false)
+    })
+    .await;
+
+    let enabled_addr: SocketAddr = format!("127.0.0.1:{enabled_port}").parse().unwrap();
+    let disabled_addr: SocketAddr = format!("127.0.0.1:{disabled_port}").parse().unwrap();
+    let mut active = connect_retry(enabled_addr).await;
+    active.write_all(b"before").await.unwrap();
+    let mut buf = [0u8; 6];
+    active.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"before");
+    assert!(connect_fails_for(disabled_addr, 5).await);
+
+    post_ok(web_addr, "/api/tunnels/pause").await;
+    wait_for_config_paused(&config_path, true).await;
+    assert_tcp_dropped(active).await;
+    assert!(connect_fails_for(enabled_addr, 10).await);
+
+    post_ok(web_addr, "/api/tunnels/unpause").await;
+    wait_for_config_paused(&config_path, false).await;
+    let mut conn = connect_retry(enabled_addr).await;
+    conn.write_all(b"after").await.unwrap();
+    let mut buf = [0u8; 5];
+    conn.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"after");
+    assert!(connect_fails_for(disabled_addr, 10).await);
 }
 
 #[tokio::test]

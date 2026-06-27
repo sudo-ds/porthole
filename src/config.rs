@@ -158,6 +158,8 @@ pub struct ClientFile {
     pub server_addr: Option<String>,
     pub server_fingerprint: Option<String>,
     pub web_bind: Option<String>,
+    #[serde(default)]
+    pub tunnels_paused: bool,
     /// Persisted only if present here (a secret sourced from env stays out of the file).
     pub secret: Option<String>,
     #[serde(default, rename = "tunnels")]
@@ -325,5 +327,29 @@ mod tests {
         assert!(parse_tunnel_spec("nope").is_err());
         assert!(parse_tunnel_spec("a=tcp:badaddr->1").is_err());
         assert!(parse_tunnel_spec("a=ftp:127.0.0.1:1->2").is_err());
+    }
+
+    #[test]
+    fn client_file_defaults_to_unpaused() {
+        let file: ClientFile = toml::from_str(
+            r#"
+server_addr = "example.com:7835"
+server_fingerprint = "sha256:test"
+"#,
+        )
+        .unwrap();
+        assert!(!file.tunnels_paused);
+    }
+
+    #[test]
+    fn client_file_persists_paused_state() {
+        let file = ClientFile {
+            tunnels_paused: true,
+            ..Default::default()
+        };
+        let toml = toml::to_string(&file).unwrap();
+        assert!(toml.contains("tunnels_paused = true"));
+        let back: ClientFile = toml::from_str(&toml).unwrap();
+        assert!(back.tunnels_paused);
     }
 }

@@ -34,6 +34,8 @@ pub async fn serve(
         .route("/", get(index))
         .route("/api/status", get(status))
         .route("/api/tunnels", post(add_tunnel))
+        .route("/api/tunnels/pause", post(pause_tunnels))
+        .route("/api/tunnels/unpause", post(unpause_tunnels))
         .route("/api/tunnels/{name}", delete(remove_tunnel))
         .route("/api/tunnels/{name}/toggle", post(toggle_tunnel))
         .with_state(state);
@@ -52,6 +54,7 @@ async fn index() -> Html<&'static str> {
 #[derive(Serialize)]
 struct StatusResponse {
     connected: bool,
+    paused: bool,
     server: String,
     uptime_secs: u64,
     min_port: u16,
@@ -100,6 +103,7 @@ async fn status(State(st): State<AppState>) -> Json<StatusResponse> {
 
     Json(StatusResponse {
         connected: shared.connected.load(Relaxed),
+        paused: shared.tunnels_paused.load(Relaxed),
         server: shared.server_addr.clone(),
         uptime_secs: shared.started.elapsed().as_secs(),
         min_port: shared.min_port.load(Relaxed),
@@ -168,5 +172,15 @@ async fn toggle_tunnel(State(st): State<AppState>, Path(name): Path<String>) -> 
         .map(|s| s.enabled.load(Relaxed))
         .unwrap_or(false);
     let _ = st.cmd_tx.send(Command::SetEnabled(name, !enabled)).await;
+    StatusCode::OK
+}
+
+async fn pause_tunnels(State(st): State<AppState>) -> impl IntoResponse {
+    let _ = st.cmd_tx.send(Command::SetPaused(true)).await;
+    StatusCode::OK
+}
+
+async fn unpause_tunnels(State(st): State<AppState>) -> impl IntoResponse {
+    let _ = st.cmd_tx.send(Command::SetPaused(false)).await;
     StatusCode::OK
 }

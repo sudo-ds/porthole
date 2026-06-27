@@ -21,6 +21,9 @@
   th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; }
   td.public a { color:var(--accent); text-decoration:none; }
   .pill { font-size:11px; padding:2px 8px; border-radius:10px; border:1px solid var(--line); color:var(--muted); }
+  .toolbar { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:12px; }
+  .state { display:flex; align-items:center; gap:8px; color:var(--muted); }
+  .paused { color:#ffa657; border-color:#ffa657; }
   .err { color:var(--down); font-size:12px; }
   .hint { color:var(--muted); font-weight:normal; }
   .tcp { color:#79c0ff; } .udp { color:#d2a8ff; }
@@ -47,7 +50,13 @@
   </div>
 </header>
 <main>
-  <h2>Tunnels</h2>
+  <div class="toolbar">
+    <div class="state">
+      <h2>Tunnels</h2>
+      <span id="pauseState" class="pill">running</span>
+    </div>
+    <button id="pauseBtn" type="button">Pause all</button>
+  </div>
   <table>
     <thead><tr>
       <th>Name</th><th>Proto</th><th>Local</th><th>Public</th>
@@ -84,13 +93,23 @@ async function refresh() {
   document.getElementById('server').textContent = st.server;
   document.getElementById('uptime').textContent = fmtDur(st.uptime_secs);
   document.getElementById('range').textContent = st.max_port ? `(allowed ${st.min_port}-${st.max_port})` : '';
+  const pauseState = document.getElementById('pauseState');
+  pauseState.textContent = st.paused ? 'paused' : 'running';
+  pauseState.className = 'pill' + (st.paused ? ' paused' : '');
+  const pauseBtn = document.getElementById('pauseBtn');
+  pauseBtn.textContent = st.paused ? 'Unpause all' : 'Pause all';
+  pauseBtn.dataset.paused = st.paused ? '1' : '0';
   const rows = document.getElementById('rows');
   rows.innerHTML = '';
   document.getElementById('empty').hidden = st.tunnels.length > 0;
   for (const t of st.tunnels) {
     const tr = document.createElement('tr');
-    const dot = `<span class="dot ${t.up ? 'up':'down'}" title="${t.up?'live':'down'}"></span>`;
-    const pub = t.error ? `<span class="err" title="${t.error}">${t.error}</span>`
+    const live = t.up && t.enabled && !st.paused;
+    const state = st.paused && t.enabled ? 'paused' : t.enabled ? (live ? 'live' : 'down') : 'disabled';
+    const dot = `<span class="dot ${live ? 'up':'down'}" title="${state}"></span>`;
+    const pub = st.paused && t.enabled ? '<span class="pill paused">paused</span>'
+              : !t.enabled ? '<span class="pill">disabled</span>'
+              : t.error ? `<span class="err" title="${t.error}">${t.error}</span>`
               : t.public ? `<a href="//${t.public}">${t.public}</a>`
               : '<span class="pill">pending</span>';
     const en = t.enabled ? 'disable' : 'enable';
@@ -113,6 +132,11 @@ document.getElementById('rows').addEventListener('click', async e => {
   if (tg) await fetch(`/api/tunnels/${encodeURIComponent(tg)}/toggle`, {method:'POST'});
   if (rm) await fetch(`/api/tunnels/${encodeURIComponent(rm)}`, {method:'DELETE'});
   if (tg || rm) refresh();
+});
+document.getElementById('pauseBtn').addEventListener('click', async e => {
+  const paused = e.target.dataset.paused === '1';
+  await fetch(paused ? '/api/tunnels/unpause' : '/api/tunnels/pause', {method:'POST'});
+  refresh();
 });
 document.getElementById('add').addEventListener('submit', async e => {
   e.preventDefault();
