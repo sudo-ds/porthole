@@ -269,6 +269,75 @@ sudo sh -c 'set -a; . /etc/porthole/porthole.env; set +a; cd /var/lib/porthole &
 Open the ingress port and your public tunnel range in the firewall (e.g.
 `ufw allow 7835/tcp`, `ufw allow 1024:65535/tcp` and `/udp`). The client needs no inbound rules.
 
+### Example: private control plane over Tailscale
+
+A useful VPS setup is to keep the relay's control plane private, while still exposing the
+tunnels themselves on the public internet:
+
+- your VPS runs porthole server and a Tailscale client
+- port `7835/tcp` and SSH are reachable only over Tailscale, by you
+- the tunnel port range, such as `10000:20000/tcp` and `/udp`, is reachable from the public
+  internet
+- the client dials the server through its Tailscale address, but the dashboard/web UI shows
+  tunnel endpoints on your public hostname
+
+For that shape, let porthole bind normally on the VPS and enforce the private control plane in
+your firewall and Tailscale ACLs:
+
+```toml
+# /etc/porthole/server.toml on the VPS
+bind_addr = "0.0.0.0"
+control_port = 7835
+min_port = 10000
+max_port = 20000
+
+# Address baked into connection codes. Use a Tailscale MagicDNS name or 100.x.y.z address
+# if clients should reach the control/data ingress only through Tailscale.
+public_host = "relay.your-tailnet.ts.net"
+```
+
+Then configure the client to connect to the Tailscale address, but display the public host for
+created tunnels:
+
+```toml
+# porthole-client.toml
+server_addr = "relay.your-tailnet.ts.net:7835"
+public_addr = "tunnels.example.com"
+web_bind = "127.0.0.1:4040"
+```
+
+Leave `web_bind` on `127.0.0.1` when you manage tunnels from the same machine. If the client
+runs somewhere else and you want to reach its web UI over Tailscale, bind it to that client's
+Tailscale address and restrict the port with Tailscale ACLs; do not expose the web UI publicly.
+
+Or, when joining from a connection code:
+
+```sh
+porthole join porthole1_... --public-addr tunnels.example.com
+```
+
+With this setup, porthole control traffic and on-demand data connections use Tailscale on
+`relay.your-tailnet.ts.net:7835`, while end users connect to public tunnel endpoints such as
+`tunnels.example.com:25565`.
+
+The exact firewall rules depend on your distro and provider, but the intent is:
+
+```sh
+# allow your private control plane
+ufw allow in on tailscale0 to any port 7835 proto tcp
+ufw allow in on tailscale0 to any port 22 proto tcp
+
+# expose only the tunnel range publicly
+ufw allow 10000:20000/tcp
+ufw allow 10000:20000/udp
+
+# do not allow public internet traffic to 7835
+```
+
+If the VPS is tagged as untrusted in Tailscale, use ACLs so it does not gain access to the rest
+of your tailnet; it only needs to accept connections from your admin devices on `7835` and
+optionally `22`.
+
 ## Security notes
 
 - The connection code contains the shared secret — treat it like a password.
