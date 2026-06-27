@@ -20,6 +20,7 @@
   th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); }
   th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; }
   td.public a { color:var(--accent); text-decoration:none; }
+  td.public .public-endpoint { display:inline-flex; align-items:center; gap:8px; flex-wrap:wrap; }
   .pill { font-size:11px; padding:2px 8px; border-radius:10px; border:1px solid var(--line); color:var(--muted); }
   .toolbar { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:12px; }
   .state { display:flex; align-items:center; gap:8px; color:var(--muted); }
@@ -30,6 +31,8 @@
   button { background:var(--panel); color:var(--fg); border:1px solid var(--line);
            border-radius:6px; padding:5px 10px; cursor:pointer; font:inherit; }
   button:hover { border-color:var(--accent); }
+  button.copy-btn { padding:2px 7px; font-size:11px; color:var(--muted); }
+  button.copy-btn:disabled { color:var(--up); border-color:var(--up); cursor:default; }
   button.danger:hover { border-color:var(--down); color:var(--down); }
   form { display:flex; flex-wrap:wrap; gap:8px; align-items:end; background:var(--panel);
          border:1px solid var(--line); border-radius:8px; padding:16px; }
@@ -85,6 +88,24 @@ const fmtDur = s => {
   const d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
   if (d) return `${d}d ${h}h`; if (h) return `${h}h ${m}m`; if (m) return `${m}m`; return `${s}s`;
 };
+const escapeHtml = value => String(value).replace(/[&<>"']/g, ch => ({
+  '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+}[ch]));
+async function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const area = document.createElement('textarea');
+  area.value = text;
+  area.setAttribute('readonly', '');
+  area.style.position = 'fixed';
+  area.style.top = '-1000px';
+  document.body.appendChild(area);
+  area.select();
+  document.execCommand('copy');
+  area.remove();
+}
 async function refresh() {
   let st;
   try { st = await (await fetch('/api/status')).json(); }
@@ -107,10 +128,11 @@ async function refresh() {
     const live = t.up && t.enabled && !st.paused;
     const state = st.paused && t.enabled ? 'paused' : t.enabled ? (live ? 'live' : 'down') : 'disabled';
     const dot = `<span class="dot ${live ? 'up':'down'}" title="${state}"></span>`;
+    const publicText = t.public ? escapeHtml(t.public) : '';
     const pub = st.paused && t.enabled ? '<span class="pill paused">paused</span>'
               : !t.enabled ? '<span class="pill">disabled</span>'
               : t.error ? `<span class="err" title="${t.error}">${t.error}</span>`
-              : t.public ? `<a href="//${t.public}">${t.public}</a>`
+              : t.public ? `<span class="public-endpoint"><a href="//${publicText}">${publicText}</a><button type="button" class="copy-btn" data-copy="${publicText}" title="Copy public address">copy</button></span>`
               : '<span class="pill">pending</span>';
     const en = t.enabled ? 'disable' : 'enable';
     tr.innerHTML =
@@ -127,6 +149,17 @@ async function refresh() {
   }
 }
 document.getElementById('rows').addEventListener('click', async e => {
+  const copyBtn = e.target.closest('[data-copy]');
+  if (copyBtn) {
+    await copyText(copyBtn.dataset.copy);
+    copyBtn.textContent = 'copied';
+    copyBtn.disabled = true;
+    setTimeout(() => {
+      copyBtn.textContent = 'copy';
+      copyBtn.disabled = false;
+    }, 1000);
+    return;
+  }
   const tg = e.target.getAttribute('data-toggle');
   const rm = e.target.getAttribute('data-remove');
   if (tg) await fetch(`/api/tunnels/${encodeURIComponent(tg)}/toggle`, {method:'POST'});
