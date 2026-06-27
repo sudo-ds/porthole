@@ -68,18 +68,20 @@ jobs:
           rustup default stable
           rustup target add "${TARGET}"
 
-      - name: Cache Rust builds
+      # Restore-only: the cache for this key is populated on `main` by
+      # warm-cache.yml. A tag run can read the default branch's cache but
+      # cannot read another tag's, so saving here would be wasted (and
+      # `save-if: false` keeps the tag from writing a dead cache entry).
+      - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: release-linux-${{ env.TARGET }}
+          shared-key: release-linux-musl
+          save-if: false
 
       - name: Install musl tools
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-
-      - name: Run tests
-        run: cargo test --locked
 
       - name: Build release binary
         run: cargo build --locked --release --target "${TARGET}"
@@ -127,15 +129,14 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Cache Rust builds
+      # Restore-only — populated on `main` by warm-cache.yml (see Linux note).
+      - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: release-windows-${{ env.TARGET }}
+          shared-key: release-windows-msvc
+          save-if: false
           workspaces: |
             . -> target
-
-      - name: Run tests
-        run: cargo test --locked
 
       - name: Build release binary
         run: cargo build --locked --release
@@ -203,6 +204,10 @@ jobs:
             type=semver,pattern={{version}},value=${{ needs.validate.outputs.tag }}
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.validate.outputs.tag }}
 
+      # Layer cache lives in the registry (a dedicated :buildcache tag), not
+      # the ref-scoped Actions cache, so it survives across release tags.
+      # mode=max also caches the cargo-chef dependency-cook layer, so only
+      # the final workspace build re-runs when sources change.
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
@@ -210,6 +215,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ steps.image.outputs.name }}:buildcache
+          cache-to: type=registry,ref=${{ steps.image.outputs.name }}:buildcache,mode=max
 
   publish:
     name: Publish Release

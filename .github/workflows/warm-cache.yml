@@ -1,0 +1,90 @@
+# Warms the release build caches on the default branch.
+#
+# GitHub Actions scopes caches by git ref: a release run (on a tag) can only
+# restore caches created on its own tag or on the default branch — never on a
+# different tag. So a cache saved during one release is invisible to the next.
+# This job builds the exact release targets on `main`, where the resulting
+# cache IS visible to every tag run, and rust-cache stores only the compiled
+# *dependencies* (workspace crates are stripped). release.yml then restores it
+# (shared-key + save-if: false) and recompiles only the crates that changed.
+#
+# Triggered only when dependencies change, so steady-state cost is ~nil. Run it
+# manually (workflow_dispatch) after a `stable` toolchain bump, which changes
+# the cache key without touching a tracked file.
+name: Warm release cache
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/warm-cache.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Only the freshest dependency set is worth caching; cancel superseded runs.
+concurrency:
+  group: warm-cache
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  warm-linux:
+    name: Warm Linux cache
+    runs-on: ubuntu-latest
+
+    env:
+      TARGET: x86_64-unknown-linux-musl
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "${TARGET}"
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-linux-musl
+
+      - name: Install musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      # Mirrors release.yml's build so the cached dependency set matches.
+      - name: Build release binary
+        run: cargo build --locked --release --target "${TARGET}"
+
+  warm-windows:
+    name: Warm Windows cache
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-windows-msvc
+          workspaces: |
+            . -> target
+
+      - name: Build release binary
+        run: cargo build --locked --release
