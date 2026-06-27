@@ -65,15 +65,18 @@ pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelConfig> {
 // Server config
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ServerFile {
-    bind_addr: Option<String>,
-    control_port: Option<u16>,
-    secret: Option<String>,
-    min_port: Option<u16>,
-    max_port: Option<u16>,
-    cert_path: Option<PathBuf>,
-    key_path: Option<PathBuf>,
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ServerFile {
+    pub bind_addr: Option<String>,
+    pub control_port: Option<u16>,
+    pub secret: Option<String>,
+    pub min_port: Option<u16>,
+    pub max_port: Option<u16>,
+    pub cert_path: Option<PathBuf>,
+    pub key_path: Option<PathBuf>,
+    /// Public address clients dial (used to build the connection code).
+    #[serde(default)]
+    pub public_host: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +88,7 @@ pub struct ServerSettings {
     pub max_port: u16,
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
+    pub public_host: Option<String>,
 }
 
 impl ServerSettings {
@@ -100,7 +104,11 @@ impl ServerSettings {
 }
 
 pub fn load_server(args: &ServerArgs) -> Result<ServerSettings> {
-    let file: ServerFile = match &args.config {
+    let path = args.config.clone().or_else(|| {
+        let p = default_server_config_path();
+        p.exists().then_some(p)
+    });
+    let file: ServerFile = match &path {
         Some(p) => {
             toml::from_str(&read_file(p)?).with_context(|| format!("parsing {}", p.display()))?
         }
@@ -137,6 +145,7 @@ pub fn load_server(args: &ServerArgs) -> Result<ServerSettings> {
             .clone()
             .or(file.key_path)
             .unwrap_or_else(|| "porthole.key".into()),
+        public_host: args.public_host.clone().or(file.public_host),
     })
 }
 
@@ -168,11 +177,15 @@ pub struct ClientSettings {
 }
 
 pub fn load_client(args: &ClientArgs) -> Result<ClientSettings> {
-    let mut file: ClientFile = match &args.config {
-        Some(p) if p.exists() => {
+    let path = args.config.clone().or_else(|| {
+        let p = default_client_config_path();
+        p.exists().then_some(p)
+    });
+    let mut file: ClientFile = match &path {
+        Some(p) => {
             toml::from_str(&read_file(p)?).with_context(|| format!("parsing {}", p.display()))?
         }
-        _ => ClientFile::default(),
+        None => ClientFile::default(),
     };
 
     // Append CLI-provided tunnels.
@@ -205,7 +218,7 @@ pub fn load_client(args: &ClientArgs) -> Result<ClientSettings> {
         server_fingerprint,
         web_bind,
         secret,
-        config_path: args.config.clone(),
+        config_path: path,
         file,
     })
 }
@@ -218,6 +231,46 @@ pub fn save_client_file(path: &Path, file: &ClientFile) -> Result<()> {
     std::fs::rename(&tmp, path)
         .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
     Ok(())
+}
+
+/// Serialize a [`ServerFile`] to its config path atomically (temp file + rename).
+pub fn save_server_file(path: &Path, file: &ServerFile) -> Result<()> {
+    let toml = toml::to_string_pretty(file).context("serializing server config")?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+/// Default config path next to the executable (falls back to the bare name in the CWD).
+pub fn default_server_config_path() -> PathBuf {
+    config_beside_exe("porthole-server.toml")
+}
+
+pub fn default_client_config_path() -> PathBuf {
+    config_beside_exe("porthole-client.toml")
+}
+
+fn config_beside_exe(name: &str) -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(name)))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// Whether a shared secret is available without a config file (env or --secret-file).
+pub fn has_secret_source(secret_file: Option<&Path>) -> bool {
+    secret_file.is_some() || std::env::var_os(ENV_SECRET).is_some_and(|s| !s.is_empty())
+}
+
+/// Generate a fresh random shared secret (244 bits of entropy, hex).
+pub fn gen_secret() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
 }
 
 // ---------------------------------------------------------------------------

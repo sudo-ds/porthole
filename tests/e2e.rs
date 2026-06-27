@@ -75,6 +75,7 @@ fn server_settings(ingress: u16, public: u16, cert: PathBuf, key: PathBuf) -> Se
         max_port: public,
         cert_path: cert,
         key_path: key,
+        public_host: None,
     }
 }
 
@@ -277,4 +278,53 @@ async fn out_of_range_register_is_rejected() {
         }
         other => panic!("expected Rejected, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn join_via_connection_code() {
+    install();
+    let echo = tcp_echo().await;
+    let (ingress, public) = (free_port(), free_port());
+    let (cert, key) = temp_paths("invite");
+    let ss = server_settings(ingress, public, cert, key);
+    let (_acceptor, fingerprint) = tls::server_acceptor(&ss).expect("cert");
+    tokio::spawn(server::run(ss));
+
+    // Build the connection code the server would print, then decode it on the client side.
+    let code = porthole::invite::encode(&porthole::invite::ConnectionInfo {
+        host: "127.0.0.1".into(),
+        port: ingress,
+        fingerprint,
+        secret: "test-secret".into(),
+    });
+    let info = porthole::invite::decode(&code).unwrap();
+    assert_eq!(info.server_addr(), format!("127.0.0.1:{ingress}"));
+
+    let tunnel = TunnelConfig {
+        name: "t".into(),
+        protocol: Proto::Tcp,
+        local_addr: echo,
+        remote_port: Some(public),
+        enabled: true,
+    };
+    let settings = ClientSettings {
+        server_addr: info.server_addr(),
+        server_fingerprint: info.fingerprint,
+        web_bind: "127.0.0.1:0".into(),
+        secret: info.secret,
+        config_path: None,
+        file: ClientFile {
+            tunnels: vec![tunnel],
+            ..Default::default()
+        },
+    };
+    tokio::spawn(client::run(settings));
+
+    let public_addr: SocketAddr = format!("127.0.0.1:{public}").parse().unwrap();
+    let mut conn = connect_retry(public_addr).await;
+    let msg = b"hello via code";
+    conn.write_all(msg).await.unwrap();
+    let mut buf = vec![0u8; msg.len()];
+    conn.read_exact(&mut buf).await.unwrap();
+    assert_eq!(buf, msg);
 }

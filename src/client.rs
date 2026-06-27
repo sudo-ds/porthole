@@ -21,7 +21,9 @@ use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::config::{save_client_file, ClientFile, ClientSettings, TunnelConfig};
+use crate::cli::{ClientArgs, JoinArgs};
+use crate::config::{self, save_client_file, ClientFile, ClientSettings, TunnelConfig};
+use crate::invite;
 use crate::protocol::{
     self, ClientMessage, Proto, ServerMessage, Wire, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT,
     NETWORK_TIMEOUT,
@@ -127,8 +129,103 @@ pub async fn run(settings: ClientSettings) -> Result<()> {
     }
 
     tracing::info!("porthole client: web UI at http://{web_bind}");
-    reconnect_supervisor(shared).await;
+    if crate::tui::enabled() {
+        let supervisor = shared.clone();
+        tokio::spawn(async move { reconnect_supervisor(supervisor).await });
+        crate::tui::run(shared).await;
+    } else {
+        reconnect_supervisor(shared).await;
+    }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// CLI entry + onboarding (use a code, an existing config, or the setup wizard)
+// ---------------------------------------------------------------------------
+
+/// Entry point for `porthole client`.
+pub async fn run_cli(args: ClientArgs) -> Result<()> {
+    if let Some(code) = args.code.clone() {
+        let settings = settings_from_code(&code, args.web_bind.clone())?;
+        save_settings(&settings);
+        return run(settings).await;
+    }
+    match config::load_client(&args) {
+        Ok(settings) => run(settings).await,
+        Err(_) => {
+            let code = wizard_get_code()?;
+            let settings = settings_from_code(&code, args.web_bind.clone())?;
+            save_settings(&settings);
+            run(settings).await
+        }
+    }
+}
+
+/// `porthole join <code>`: configure from a connection code and connect.
+pub async fn join(args: JoinArgs) -> Result<()> {
+    let settings = settings_from_code(&args.code, args.web_bind.clone())?;
+    save_settings(&settings);
+    run(settings).await
+}
+
+/// Turn a connection code into client settings, preserving any existing tunnels.
+fn settings_from_code(code: &str, web_bind: Option<String>) -> Result<ClientSettings> {
+    let info = invite::decode(code)?;
+    let path = config::default_client_config_path();
+    let mut file: ClientFile = if path.exists() {
+        toml::from_str(&std::fs::read_to_string(&path).unwrap_or_default()).unwrap_or_default()
+    } else {
+        ClientFile::default()
+    };
+    file.server_addr = Some(info.server_addr());
+    file.server_fingerprint = Some(info.fingerprint.clone());
+    file.secret = Some(info.secret.clone());
+    let web = web_bind
+        .or_else(|| file.web_bind.clone())
+        .unwrap_or_else(|| crate::protocol::DEFAULT_WEB_BIND.to_string());
+    file.web_bind = Some(web.clone());
+
+    Ok(ClientSettings {
+        server_addr: info.server_addr(),
+        server_fingerprint: info.fingerprint,
+        web_bind: web,
+        secret: info.secret,
+        config_path: Some(path),
+        file,
+    })
+}
+
+fn save_settings(settings: &ClientSettings) {
+    if let Some(path) = &settings.config_path {
+        if let Err(e) = save_client_file(path, &settings.file) {
+            tracing::warn!("couldn't save config: {e:#}");
+        }
+    }
+}
+
+fn wizard_get_code() -> Result<String> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return Err(anyhow!(
+            "not configured yet — run `porthole join <code>` with the connection code from the relay operator"
+        ));
+    }
+    println!("\nLet's connect you to a porthole relay.");
+    println!("Ask the operator for a connection code (it starts with `porthole1_`).\n");
+    loop {
+        print!("Paste your connection code: ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        let code = line.trim().to_string();
+        if code.is_empty() {
+            continue;
+        }
+        match invite::decode(&code) {
+            Ok(_) => return Ok(code),
+            Err(e) => println!("  Hmm, that code doesn't look right ({e}). Try again.\n"),
+        }
+    }
 }
 
 fn status_from(t: &TunnelConfig) -> TunnelStatus {
@@ -194,13 +291,20 @@ async fn connect_and_run(shared: &Arc<ClientShared>) -> Result<()> {
     tracing::info!("connecting to {}", shared.server_addr);
     let tcp = TcpStream::connect(&shared.server_addr)
         .await
-        .context("connecting to server")?;
+        .with_context(|| {
+            format!(
+                "couldn't reach {} — check the address and that the relay is running",
+                shared.server_addr
+            )
+        })?;
     net::set_keepalive(&tcp);
     let tls = shared
         .connector
         .connect(shared.server_name.clone(), tcp)
         .await
-        .context("tls handshake (check the pinned fingerprint)")?;
+        .context(
+            "TLS handshake failed — the server's certificate may not match your connection code",
+        )?;
     let mut wire = protocol::wire(tls);
 
     protocol::send_msg(
@@ -306,7 +410,9 @@ async fn connect_and_run(shared: &Arc<ClientShared>) -> Result<()> {
                 Ok(ServerMessage::Error { message, fatal }) => {
                     tracing::warn!("server: {message}");
                     if fatal {
-                        break Err(anyhow!("server rejected us: {message}"));
+                        break Err(anyhow!(
+                            "the relay refused the connection ({message}) — your code's secret may be wrong or revoked"
+                        ));
                     }
                 }
                 Err(e) => break Err(e.into()),

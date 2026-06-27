@@ -1,132 +1,173 @@
+<!-- logo -->
+```
+       .-"""""-.
+     .'  o o o  '.
+    /  o  ___  o  \
+   |  o  /   \  o  |     p o r t h o l e
+   |  o |     | o  |     self-hosted tunnels
+    \  o  \___/  o  /
+     '.  o o o  .'
+       '-.....-'
+```
+
 # porthole
 
-A simple, self-hosted TCP/UDP tunneling & relay service — a minimal alternative to
-playit.gg / ngrok / `bore` that **you** run. Expose a service on a machine behind NAT
-(no port forwarding) to the public internet through a server you control (e.g. a $5
-droplet).
+A simple, self-hosted TCP/UDP tunneling & relay — a tiny alternative to playit.gg / ngrok /
+`bore` that **you** run. Expose a service on a machine behind NAT (no port forwarding) to the
+public internet through a server you control (e.g. a $5 VPS).
 
 - **TCP and UDP** tunnels
-- **TLS everywhere** with certificate pinning (no domain or CA needed) + a shared token
-- **Interactive web UI** on the client — add / remove / toggle tunnels at runtime
-- **Fixed public ports** (request the exact port you want) within a server-allowed range
-- A single static binary; one `porthole server` on the droplet, one `porthole client` at home
+- **Share one connection code** — no certs, fingerprints, or config files to hand-edit
+- **Live terminal dashboard** (logo + stats + logs) and an **interactive web UI**
+- **TLS everywhere** with certificate pinning + a shared token — secure by default
+- A single static binary; one `porthole server`, one `porthole client`
+
+## Quick start — share a connection code
+
+**On your server** (a VPS with a public IP):
+
+```sh
+porthole server
+# First run sets everything up and prints a connection code:
+#
+#   Share this connection code with anyone who should tunnel through you:
+#
+#       porthole1_eyJob3N0IjoiMTB4ZGV2LnNrIiwicG9ydCI6NzgzNS...
+#
+#   They run:  porthole join <code>
+```
+
+**On the other machine** (behind NAT — your PC, a friend's PC):
+
+```sh
+porthole join porthole1_eyJob3N0Ijoi...      # paste the code you were given
+```
+
+That's it. The client connects, opens its dashboard, and you add tunnels (in the live web UI
+at `http://127.0.0.1:4040`, or in the config). To expose a Minecraft server, point a tunnel at
+`127.0.0.1:25565` and players connect to `your-server:25565`.
+
+No code yet? Run the client with no arguments and it'll ask you to paste one:
+
+```sh
+porthole client      # prompts: "Paste your connection code:" (or set it up in the browser)
+```
 
 ## How it works
 
-The client is behind NAT and can't accept inbound connections, so it opens an **outbound**
-TLS control connection to the server. The server has a public IP and listens on one ingress
-port plus your public tunnel ports.
-
-- **TCP:** when an end-user connects to a public port, the server tells the client over the
-  control connection; the client dials a fresh outbound data connection (paired by an
-  unguessable id) and the server splices the two. Your local service is reached at
-  `127.0.0.1:<local-port>`.
-- **UDP:** each UDP tunnel multiplexes all datagrams over one data connection, tagged with
-  the end-user's address; the client keeps one ephemeral socket per end-user.
+The client is behind NAT and can't accept inbound connections, so it makes an **outbound** TLS
+connection to the server (which always works through NAT). The server has a public IP and
+relays public traffic back over connections the client opened.
 
 ```
-end-user ──▶ droplet:25565 ──(TLS)──▶ porthole server ──(TLS)──▶ porthole client ──▶ 127.0.0.1:25565
+   end user            porthole SERVER                  porthole CLIENT          your service
+ (the internet)        (public VPS)                     (behind NAT)             (localhost)
+
+   ┌────────┐  TCP/UDP   ┌───────────────────┐            ┌──────────────┐         ┌──────────┐
+   │ player ├──────────► │ public port :25565│            │              │  dials  │ 127.0.0.1│
+   │        │            │                   │            │              ├───────► │  :25565  │
+   └────────┘            │ one TLS ingress   │            │              │         └──────────┘
+                         │      :7835        │            │              │
+                         └───────────────────┘            └──────────────┘
+                              ▲         ▲                    │        │
+                control conn  │         │   data conns       │        │
+                (client dials ─┘         └─ (client dials ───┘        │
+                 OUT, stays open)           OUT, on demand) ──────────┘
 ```
+
+- **Control connection** — one long-lived TLS connection the client opens to the server. It
+  carries auth, tunnel registration, and "a connection arrived" notifications.
+- **TCP** — when someone hits a public port, the server tells the client; the client opens a
+  fresh outbound data connection (paired by an unguessable id) and the server splices the two.
+- **UDP** — datagrams are multiplexed over one data connection per tunnel, tagged with the
+  end-user's address.
+- **Security** — all hops between client and server are TLS. The server uses a self-signed
+  certificate; its fingerprint travels inside the connection code, so the client pins it (no
+  CA or domain needed). A shared token (also in the code) authenticates the client.
+
+## The client experience
+
+On an interactive terminal the client shows a live dashboard:
+
+```
+       .-"""""-.
+     .'  o o o  '.        ... (purple logo) ...
+       '-.....-'
+  client · v0.1.0
+
+  ● connected to 10xdev.sk:7835    public ports 1024-65535
+
+    NAME           PROTO LOCAL              PUBLIC               STATUS      IN       OUT  CONNS
+  ● minecraft      tcp   127.0.0.1:25565    10xdev.sk:25565      up       1.2 M    3.4 M     2
+
+  ── logs ──────────────────────────────────────────────────
+  tunnel 'minecraft' (tcp) is live at 10xdev.sk:25565
+```
+
+The web UI at `http://127.0.0.1:4040` shows the same and lets you add/remove/toggle tunnels.
+Use `--no-banner` for plain log output (e.g. under a service manager).
+
+## Configuration & CLI
+
+```
+porthole server [--public-host HOST] [--show-invite] [--config FILE] [--min-port N] [--max-port N]
+porthole client [--code CODE] [--config FILE] [--web-bind 127.0.0.1:4040]
+porthole join <CODE>
+porthole gen-token
+```
+
+- `porthole server --show-invite [--public-host your.domain]` reprints the connection code.
+- Config files (`porthole-server.toml`, `porthole-client.toml`) are created next to the binary
+  and updated as you change tunnels. See `config/*.example.toml`.
+
+## Advanced (manual setup, no connection code)
+
+You can wire things up by hand if you prefer. The server prints its certificate fingerprint at
+startup; pin it on the client:
+
+```sh
+# server
+PORTHOLE_SECRET=$(porthole gen-token) porthole server --min-port 20000 --max-port 30000
+# client
+PORTHOLE_SECRET=... porthole client \
+  --server your-server:7835 \
+  --fingerprint sha256:<from the server log> \
+  --tunnel mc=tcp:127.0.0.1:25565->25565
+```
+
+`--tunnel` spec is `name=proto:LOCAL->REMOTE` (use REMOTE `0` for a server-assigned port).
 
 ## Build
 
 Requires a recent Rust toolchain (`rustup`).
 
 ```sh
-cargo build --release        # -> target/release/porthole
-```
-
-A static Linux binary for the droplet (no glibc surprises):
-
-```sh
+cargo build --release          # -> target/release/porthole
+# static Linux binary for a VPS:
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
-# or, if you have Docker:  cross build --release --target x86_64-unknown-linux-musl
-# or:                      cargo zigbuild --release --target x86_64-unknown-linux-musl
 ```
 
-The simplest path if cross-compiling is fussy: `git clone` on the droplet and
-`cargo build --release` there.
+The simplest deploy: `git clone` on the VPS and `cargo build --release` there.
 
-## Quick start (local)
+## Deploy the server (systemd)
+
+`scp` the binary to `/usr/local/bin/porthole`, then:
 
 ```sh
-# 1. one shared secret for both sides
-export PORTHOLE_SECRET=$(porthole gen-token)
-
-# 2. server (prints its certificate fingerprint — copy it)
-porthole server --bind 127.0.0.1 --control-port 7835 --min-port 20000 --max-port 20010
-
-# 3. client: tunnel a local service (e.g. a Minecraft server on 25565)
-porthole client \
-  --server 127.0.0.1:7835 \
-  --fingerprint sha256:<the fingerprint from step 2> \
-  --tunnel mc=tcp:127.0.0.1:25565->25565
-
-# 4. open the web UI
-#    http://127.0.0.1:4040
+cp porthole.service /etc/systemd/system/porthole.service   # hardened unit, DynamicUser
+systemctl enable --now porthole
+porthole server --show-invite --public-host your.domain     # get a code to share
 ```
 
-`--tunnel` spec is `name=proto:LOCAL->REMOTE` (use REMOTE `0` for a server-assigned port).
+Open the ingress port and your public tunnel range in the firewall (e.g.
+`ufw allow 7835/tcp`, `ufw allow 1024:65535/tcp` and `/udp`). The client needs no inbound rules.
 
-## Deploy the server on a droplet
+## Security notes
 
-1. Copy the binary: `scp target/.../porthole root@droplet:/usr/local/bin/porthole`
-2. Config + secret:
-   ```sh
-   ssh root@droplet
-   mkdir -p /etc/porthole
-   cp server.example.toml /etc/porthole/server.toml      # edit min/max ports
-   printf 'PORTHOLE_SECRET=%s\n' "$(porthole gen-token)" > /etc/porthole/porthole.env
-   chmod 600 /etc/porthole/porthole.env
-   ```
-   With the provided systemd unit the cert/key land in `/var/lib/porthole`
-   (`WorkingDirectory` + `StateDirectory`); the defaults `porthole.crt` / `porthole.key`
-   resolve there.
-3. Firewall — open the ingress port and your public tunnel range:
-   ```sh
-   ufw allow 7835/tcp
-   ufw allow 20000:30000/tcp
-   ufw allow 20000:30000/udp
-   ```
-   The home client needs **no** inbound rules.
-4. Service:
-   ```sh
-   cp porthole.service /etc/systemd/system/porthole.service
-   systemctl enable --now porthole
-   journalctl -u porthole -f      # note the printed server_fingerprint
-   ```
-5. On the client, set `server_addr`, `server_fingerprint`, and the same secret, then run
-   `porthole client --config client.toml`.
-
-## Web UI
-
-The client serves a local dashboard at `http://127.0.0.1:4040` (loopback only). It shows each
-tunnel's status, public address, traffic, and active connections, and lets you add, remove,
-enable, or disable tunnels at runtime. Changes are persisted to the client config file
-(if one is in use).
-
-## Configuration
-
-See `config/server.example.toml` and `config/client.example.toml`. Precedence is
-**CLI flag > `PORTHOLE_SECRET` / env > config file > default**.
-
-| | Server | Client |
-|---|---|---|
-| key fields | `bind_addr`, `control_port`, `min_port`, `max_port`, `cert_path`, `key_path` | `server_addr`, `server_fingerprint`, `web_bind`, `[[tunnels]]` |
-| secret | `PORTHOLE_SECRET` / `--secret-file` / `secret` | same |
-
-## Security
-
-- All control and relayed traffic is encrypted with TLS. The server uses a self-signed
-  certificate generated on first run; the client pins its SHA-256 fingerprint, so no CA or
-  domain is required. **Keep the cert/key stable** — regenerating them changes the
-  fingerprint and clients must re-pin.
-- Clients authenticate with a shared bearer token (constant-time compared) sent inside TLS.
-- The server only grants public ports inside `[min_port, max_port]`; defaults stay above
-  1024 so no privileged bind is needed.
-- Prefer `PORTHOLE_SECRET` or `--secret-file` over putting the secret on the command line
-  (argv is visible in `ps`).
+- The connection code contains the shared secret — treat it like a password.
+- Regenerating the server cert changes its fingerprint; existing codes/clients must re-pin.
+- The server only grants public ports inside its configured range.
 
 ## License
 

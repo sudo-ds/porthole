@@ -4,14 +4,17 @@
 //! connections the client initiates outbound. See the `server` and `client` modules.
 
 pub mod auth;
+pub mod banner;
 pub mod cli;
 pub mod client;
 pub mod config;
+pub mod invite;
 pub mod net;
 pub mod protocol;
 pub mod server;
 pub mod tcp;
 pub mod tls;
+pub mod tui;
 pub mod udp;
 pub mod web;
 

@@ -17,6 +17,10 @@ pub struct Cli {
     /// Increase log verbosity (-v = debug, -vv = trace). Overrides RUST_LOG.
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
+
+    /// Don't print the startup banner.
+    #[arg(long, global = true)]
+    pub no_banner: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -25,8 +29,19 @@ pub enum Command {
     Server(ServerArgs),
     /// Run the tunnel client (on the machine behind NAT). Also serves the local web UI.
     Client(ClientArgs),
+    /// Connect to a relay using a connection code from its operator (porthole1_...).
+    Join(JoinArgs),
     /// Print a fresh random secret token (use it on both server and client).
     GenToken,
+}
+
+#[derive(Args, Debug)]
+pub struct JoinArgs {
+    /// The connection code from the relay operator (porthole1_...).
+    pub code: String,
+    /// Address for the local web UI (default 127.0.0.1:4040).
+    #[arg(long)]
+    pub web_bind: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -55,6 +70,12 @@ pub struct ServerArgs {
     /// TLS private key path (PEM). Auto-generated on first run if missing.
     #[arg(long, value_name = "FILE")]
     pub key_path: Option<PathBuf>,
+    /// Public address (host or IP) clients use to reach this server; used in the connection code.
+    #[arg(long)]
+    pub public_host: Option<String>,
+    /// Print a connection code to share with clients, then exit.
+    #[arg(long)]
+    pub show_invite: bool,
 }
 
 #[derive(Args, Debug)]
@@ -62,6 +83,9 @@ pub struct ClientArgs {
     /// TOML config file (CLI flags override its values; tunnels are appended).
     #[arg(long, value_name = "FILE")]
     pub config: Option<PathBuf>,
+    /// Connection code from the relay operator (porthole1_...); fills in server, fingerprint, secret.
+    #[arg(long)]
+    pub code: Option<String>,
     /// Server address, host:port.
     #[arg(long)]
     pub server: Option<String>,

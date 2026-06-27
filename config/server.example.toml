@@ -8,6 +8,9 @@
 bind_addr = "0.0.0.0"
 control_port = 7835
 
+# Public address clients use to reach this server (baked into the connection code).
+# public_host = "your.domain.com"
+
 # Shared secret. Prefer PORTHOLE_SECRET / --secret-file; uncomment to set inline.
 # secret = "CHANGE_ME"   # generate one with: porthole gen-token
 

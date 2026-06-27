@@ -2,6 +2,7 @@
 //! demultiplexes control connections (which register tunnels) from data connections
 //! (which fulfil a pending TCP accept or carry a UDP tunnel's datagrams).
 
+use std::io::{IsTerminal, Write as _};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -10,13 +11,16 @@ use bytes::Bytes;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::config::ServerSettings;
+use crate::cli::ServerArgs;
+use crate::config::{self, ServerFile, ServerSettings};
+use crate::invite::{self, ConnectionInfo};
 use crate::protocol::{
     self, ClientMessage, Proto, ServerMessage, Wire, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT,
     NETWORK_TIMEOUT,
@@ -84,6 +88,7 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
     );
     tracing::info!("server certificate fingerprint (pin this on the client):");
     tracing::info!("    server_fingerprint = \"{fingerprint}\"");
+    tracing::info!("get a shareable connection code with: porthole server --show-invite");
 
     let shutdown = CancellationToken::new();
     {
@@ -413,4 +418,127 @@ fn auth_error() -> ServerMessage {
         message: "authentication failed".into(),
         fatal: true,
     }
+}
+
+// ---------------------------------------------------------------------------
+// CLI entry + first-run onboarding
+// ---------------------------------------------------------------------------
+
+/// Entry point for `porthole server`: first-run setup if needed, `--show-invite`, then run.
+pub async fn run_cli(args: ServerArgs) -> Result<()> {
+    let needs_setup = args.config.is_none()
+        && !config::default_server_config_path().exists()
+        && !config::has_secret_source(args.secret_file.as_deref());
+
+    let settings = if needs_setup {
+        first_run_setup(&args).await?
+    } else {
+        config::load_server(&args)?
+    };
+
+    if args.show_invite {
+        return print_invite(&settings);
+    }
+    if needs_setup {
+        let _ = print_invite(&settings); // show the code right after first-time setup
+    }
+    run(settings).await
+}
+
+async fn first_run_setup(args: &ServerArgs) -> Result<ServerSettings> {
+    println!("Welcome! Setting up your porthole relay for the first time.\n");
+    let host = match args.public_host.clone() {
+        Some(h) => h,
+        None => match detect_public_ip().await {
+            Some(ip) => prompt_default("Public address people will use to reach this server", &ip),
+            None => prompt_default(
+                "Public address people will use to reach this server (domain or IP)",
+                "YOUR.SERVER.IP",
+            ),
+        },
+    };
+
+    let file = ServerFile {
+        bind_addr: Some("0.0.0.0".into()),
+        control_port: Some(protocol::DEFAULT_CONTROL_PORT),
+        secret: Some(config::gen_secret()),
+        min_port: Some(1024),
+        max_port: Some(65535),
+        cert_path: Some("porthole.crt".into()),
+        key_path: Some("porthole.key".into()),
+        public_host: Some(host),
+    };
+    let path = config::default_server_config_path();
+    config::save_server_file(&path, &file)?;
+    println!("Saved settings to {}\n", path.display());
+
+    config::load_server(args)
+}
+
+/// Build and print the connection code clients paste to connect.
+fn print_invite(settings: &ServerSettings) -> Result<()> {
+    let (_acceptor, fingerprint) = tls::server_acceptor(settings)?;
+    let host = settings
+        .public_host
+        .clone()
+        .context("unknown public address — re-run with --public-host <domain-or-ip>")?;
+    let code = invite::encode(&ConnectionInfo {
+        host,
+        port: settings.control_port,
+        fingerprint,
+        secret: settings.secret.clone(),
+    });
+    print_invite_box(&code);
+    Ok(())
+}
+
+fn print_invite_box(code: &str) {
+    let color = std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal();
+    let (p, r) = if color {
+        ("\x1b[1;38;2;168;85;247m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+    println!();
+    println!("  {p}Share this connection code with anyone who should tunnel through you:{r}");
+    println!();
+    println!("    {p}{code}{r}");
+    println!();
+    println!("  They run:  porthole join <code>   (or paste it into the porthole window)");
+    println!();
+}
+
+/// Best-effort public-IP detection via a tiny plain-HTTP request. None on any failure.
+async fn detect_public_ip() -> Option<String> {
+    let fut = async {
+        let mut s = TcpStream::connect("api.ipify.org:80").await.ok()?;
+        s.write_all(b"GET / HTTP/1.0\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n")
+            .await
+            .ok()?;
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.ok()?;
+        let text = String::from_utf8_lossy(&buf);
+        let body = text.split("\r\n\r\n").nth(1)?.trim().to_string();
+        (!body.is_empty() && body.len() < 64).then_some(body)
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(4), fut)
+        .await
+        .ok()
+        .flatten()
+}
+
+fn prompt_default(question: &str, default: &str) -> String {
+    if !std::io::stdin().is_terminal() {
+        return default.to_string();
+    }
+    print!("{question} [{default}]: ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_ok() {
+        let t = line.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    default.to_string()
 }

@@ -1,42 +1,69 @@
+use std::io::IsTerminal;
+
 use anyhow::Result;
 use clap::Parser;
-use uuid::Uuid;
 
 use porthole::cli::{Cli, Command};
-use porthole::{client, config, install_crypto_provider, server};
+use porthole::{banner, client, config, install_crypto_provider, server, tui};
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    init_tracing(cli.verbose);
+
+    // A client on an interactive terminal gets the live dashboard; its logs go into the
+    // dashboard's ring buffer rather than scrolling stdout.
+    let dashboard = !cli.no_banner
+        && std::io::stdout().is_terminal()
+        && matches!(cli.command, Command::Client(_) | Command::Join(_));
+    init_tracing(cli.verbose, dashboard);
+    if dashboard {
+        tui::set_enabled(true);
+    }
+
     install_crypto_provider()?;
+    let show_banner = !cli.no_banner;
 
     match cli.command {
         Command::GenToken => {
-            // 244 bits of entropy, hex.
-            println!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+            println!("{}", config::gen_secret());
             Ok(())
         }
         Command::Server(args) => {
-            let settings = config::load_server(&args)?;
-            server::run(settings).await
+            banner::print(&format!("relay server · v{VERSION}"), show_banner);
+            server::run_cli(args).await
         }
         Command::Client(args) => {
-            let settings = config::load_client(&args)?;
-            client::run(settings).await
+            banner::print(&format!("client · v{VERSION}"), show_banner);
+            client::run_cli(args).await
+        }
+        Command::Join(args) => {
+            banner::print(&format!("client · v{VERSION}"), show_banner);
+            client::join(args).await
         }
     }
 }
 
-fn init_tracing(verbose: u8) {
+fn init_tracing(verbose: u8, to_buffer: bool) {
     use tracing_subscriber::EnvFilter;
     let filter = match verbose {
         0 => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         1 => EnvFilter::new("porthole=debug,info"),
         _ => EnvFilter::new("porthole=trace,debug"),
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
+    if to_buffer {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(tui::make_writer())
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .init();
+    }
 }
