@@ -3,6 +3,10 @@
 
 server_addr = "your.droplet.example.com:7835"
 
+# Optional public host/IP to show for tunnel endpoints in the dashboard and web UI.
+# Use this when server_addr is a private control address, such as a Tailscale IP.
+# public_addr = "10xdev.sk"
+
 # Pin the server's certificate fingerprint (the server prints it at startup).
 server_fingerprint = "sha256:REPLACE_WITH_SERVER_FINGERPRINT"
 

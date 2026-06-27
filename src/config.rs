@@ -219,6 +219,9 @@ pub struct ClientFile {
     pub server_addr: Option<String>,
     pub server_fingerprint: Option<String>,
     pub web_bind: Option<String>,
+    /// Public host/IP shown for tunnel endpoints. Defaults to the host from `server_addr`.
+    #[serde(default)]
+    pub public_addr: Option<String>,
     #[serde(default)]
     pub tunnels_paused: bool,
     /// Persisted only if present here (a secret sourced from env stays out of the file).
@@ -234,6 +237,7 @@ pub struct ClientSettings {
     pub server_addr: String,
     pub server_fingerprint: String,
     pub web_bind: String,
+    pub public_addr: Option<String>,
     pub secret: String,
     /// Where to persist tunnel changes (None => no config file in use).
     pub config_path: Option<PathBuf>,
@@ -278,10 +282,16 @@ pub fn load_client(args: &ClientArgs) -> Result<ClientSettings> {
         .or_else(|| file.web_bind.clone())
         .unwrap_or_else(|| DEFAULT_WEB_BIND.to_string());
 
+    let public_addr = args
+        .public_addr
+        .clone()
+        .or_else(|| file.public_addr.clone());
+
     Ok(ClientSettings {
         server_addr,
         server_fingerprint,
         web_bind,
+        public_addr,
         secret,
         config_path: path,
         file,

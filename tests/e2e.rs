@@ -110,6 +110,7 @@ fn client_settings_with(
         server_addr: format!("127.0.0.1:{ingress}"),
         server_fingerprint: fingerprint,
         web_bind,
+        public_addr: None,
         secret: "test-secret".into(),
         config_path,
         file: ClientFile {

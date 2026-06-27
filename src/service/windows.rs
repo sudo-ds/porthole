@@ -306,6 +306,7 @@ fn client_args(config_path: PathBuf) -> ClientArgs {
         server: None,
         fingerprint: None,
         web_bind: None,
+        public_addr: None,
         secret_file: None,
         tunnels: Vec::new(),
     }

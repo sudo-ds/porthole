@@ -118,6 +118,9 @@ pub struct JoinArgs {
     /// Address for the local web UI (default 127.0.0.1:4040).
     #[arg(long)]
     pub web_bind: Option<String>,
+    /// Public host or IP to show for tunnel endpoints; defaults to the server address host.
+    #[arg(long, value_name = "HOST")]
+    pub public_addr: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -171,6 +174,9 @@ pub struct ClientArgs {
     /// Address for the local web UI (default 127.0.0.1:4040).
     #[arg(long)]
     pub web_bind: Option<String>,
+    /// Public host or IP to show for tunnel endpoints; defaults to the server address host.
+    #[arg(long, value_name = "HOST")]
+    pub public_addr: Option<String>,
     /// File containing the shared secret.
     #[arg(long, value_name = "FILE")]
     pub secret_file: Option<PathBuf>,

@@ -121,8 +121,8 @@ Use `--no-banner` for plain log output (e.g. under a service manager).
 
 ```
 porthole server [--public-host HOST] [--show-invite] [--config FILE] [--min-port N] [--max-port N]
-porthole client [--code CODE] [--config FILE] [--web-bind 127.0.0.1:4040]
-porthole join <CODE>
+porthole client [--code CODE] [--config FILE] [--web-bind 127.0.0.1:4040] [--public-addr HOST]
+porthole join <CODE> [--public-addr HOST]
 porthole service install server|client [--config FILE] [--working-dir DIR] [--start]
 porthole service uninstall server|client
 porthole gen-token
@@ -137,6 +137,9 @@ porthole gen-token
   fingerprint and shared secret, and the client saves them as `server_fingerprint` and `secret`.
   If you need to override the secret manually, use `porthole client` with `PORTHOLE_SECRET`,
   `--secret-file`, or a `secret = "..."` entry in the client config instead of `join`.
+- Set `public_addr = "10xdev.sk"` in the client config, or pass `--public-addr HOST`,
+  to show tunnel endpoints as `HOST:<public_port>` while still dialing `server_addr` for the
+  control/data connections.
 - Config files (`porthole-server.toml`, `porthole-client.toml`) are created next to the binary
   and updated as you change tunnels or pause/unpause them. See `config/*.example.toml`.
 - `porthole server`, `porthole client`, and `porthole join` write daily rotated logs to

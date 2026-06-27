@@ -56,6 +56,7 @@ pub struct TunnelStatus {
 /// State shared between the control loop, data tasks, and the web UI.
 pub struct ClientShared {
     pub server_addr: String,
+    pub public_addr: Option<String>,
     pub secret: String,
     pub connector: TlsConnector,
     pub server_name: ServerName<'static>,
@@ -110,6 +111,7 @@ pub async fn run_with_shutdown(
 
     let shared = Arc::new(ClientShared {
         server_addr: settings.server_addr.clone(),
+        public_addr: settings.public_addr.clone(),
         secret: settings.secret.clone(),
         connector,
         server_name,
@@ -156,7 +158,7 @@ pub async fn run_with_shutdown(
 /// Entry point for `porthole client`.
 pub async fn run_cli(args: ClientArgs) -> Result<()> {
     if let Some(code) = args.code.clone() {
-        let settings = settings_from_code(&code, args.web_bind.clone())?;
+        let settings = settings_from_code(&code, args.web_bind.clone(), args.public_addr.clone())?;
         save_settings(&settings);
         return run(settings).await;
     }
@@ -164,7 +166,8 @@ pub async fn run_cli(args: ClientArgs) -> Result<()> {
         Ok(settings) => run(settings).await,
         Err(_) => {
             let code = wizard_get_code()?;
-            let settings = settings_from_code(&code, args.web_bind.clone())?;
+            let settings =
+                settings_from_code(&code, args.web_bind.clone(), args.public_addr.clone())?;
             save_settings(&settings);
             run(settings).await
         }
@@ -173,19 +176,29 @@ pub async fn run_cli(args: ClientArgs) -> Result<()> {
 
 /// `porthole join <code>`: configure from a connection code and connect.
 pub async fn join(args: JoinArgs) -> Result<()> {
-    let settings = settings_from_code(&args.code, args.web_bind.clone())?;
+    let settings = settings_from_code(&args.code, args.web_bind.clone(), args.public_addr.clone())?;
     save_settings(&settings);
     run(settings).await
 }
 
 /// Turn a connection code into client settings, preserving any existing tunnels.
-fn settings_from_code(code: &str, web_bind: Option<String>) -> Result<ClientSettings> {
-    settings_from_code_at(code, web_bind, config::default_client_config_path())
+fn settings_from_code(
+    code: &str,
+    web_bind: Option<String>,
+    public_addr: Option<String>,
+) -> Result<ClientSettings> {
+    settings_from_code_at(
+        code,
+        web_bind,
+        public_addr,
+        config::default_client_config_path(),
+    )
 }
 
 fn settings_from_code_at(
     code: &str,
     web_bind: Option<String>,
+    public_addr: Option<String>,
     path: impl AsRef<Path>,
 ) -> Result<ClientSettings> {
     let info = invite::decode(code)?;
@@ -202,11 +215,14 @@ fn settings_from_code_at(
         .or_else(|| file.web_bind.clone())
         .unwrap_or_else(|| crate::protocol::DEFAULT_WEB_BIND.to_string());
     file.web_bind = Some(web.clone());
+    let public_addr = public_addr.or_else(|| file.public_addr.clone());
+    file.public_addr = public_addr.clone();
 
     Ok(ClientSettings {
         server_addr: info.server_addr(),
         server_fingerprint: info.fingerprint,
         web_bind: web,
+        public_addr,
         secret: info.secret,
         config_path: Some(path),
         file,
@@ -450,7 +466,11 @@ fn apply_accepted(
     remote_port: u16,
     token: Option<Uuid>,
 ) {
-    let public = format!("{}:{}", host_of(&shared.server_addr), remote_port);
+    let public = public_endpoint(
+        shared.public_addr.as_deref(),
+        &shared.server_addr,
+        remote_port,
+    );
     if let Some(s) = shared.status.get(&name) {
         *s.public_addr.lock().unwrap() = Some(public.clone());
         *s.error.lock().unwrap() = None;
@@ -659,6 +679,22 @@ fn host_of(addr: &str) -> &str {
     }
 }
 
+fn public_endpoint(public_addr: Option<&str>, server_addr: &str, remote_port: u16) -> String {
+    let host = public_addr
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .unwrap_or_else(|| host_of(server_addr));
+    format_host_port(host, remote_port)
+}
+
+fn format_host_port(host: &str, port: u16) -> String {
+    if host.starts_with('[') || !host.contains(':') {
+        format!("{host}:{port}")
+    } else {
+        format!("[{host}]:{port}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,6 +730,7 @@ mod tests {
 
         Arc::new(ClientShared {
             server_addr: "relay.example.com:7835".into(),
+            public_addr: file.public_addr.clone(),
             secret: "test-secret".into(),
             connector: tls::client_connector(&format!("sha256:{}", "00".repeat(32))).unwrap(),
             server_name: tls::pinned_server_name(),
@@ -713,7 +750,7 @@ mod tests {
     #[test]
     fn settings_from_code_decodes_invite_without_network() {
         let path = temp_client_path("decode");
-        let settings = settings_from_code_at(&connection_code(), None, &path).unwrap();
+        let settings = settings_from_code_at(&connection_code(), None, None, &path).unwrap();
 
         assert_eq!(settings.server_addr, "relay.example.com:7835");
         assert_eq!(settings.server_fingerprint, "sha256:test-fingerprint");
@@ -740,13 +777,56 @@ mod tests {
         };
         std::fs::write(&path, toml::to_string(&existing).unwrap()).unwrap();
 
-        let settings =
-            settings_from_code_at(&connection_code(), Some("127.0.0.1:5050".into()), &path)
-                .unwrap();
+        let settings = settings_from_code_at(
+            &connection_code(),
+            Some("127.0.0.1:5050".into()),
+            None,
+            &path,
+        )
+        .unwrap();
 
         assert_eq!(settings.web_bind, "127.0.0.1:5050");
         assert_eq!(settings.file.web_bind.as_deref(), Some("127.0.0.1:5050"));
         assert_eq!(settings.file.tunnels, vec![tunnel]);
+    }
+
+    #[test]
+    fn settings_from_code_preserves_existing_public_addr() {
+        let path = temp_client_path("public-addr");
+        let existing = ClientFile {
+            public_addr: Some("10xdev.sk".into()),
+            ..Default::default()
+        };
+        std::fs::write(&path, toml::to_string(&existing).unwrap()).unwrap();
+
+        let settings = settings_from_code_at(&connection_code(), None, None, &path).unwrap();
+
+        assert_eq!(settings.public_addr.as_deref(), Some("10xdev.sk"));
+        assert_eq!(settings.file.public_addr.as_deref(), Some("10xdev.sk"));
+    }
+
+    #[test]
+    fn public_endpoint_uses_override_host() {
+        assert_eq!(
+            public_endpoint(Some("10xdev.sk"), "100.64.0.1:7835", 25565),
+            "10xdev.sk:25565"
+        );
+    }
+
+    #[test]
+    fn public_endpoint_falls_back_to_server_host() {
+        assert_eq!(
+            public_endpoint(None, "100.64.0.1:7835", 25565),
+            "100.64.0.1:25565"
+        );
+    }
+
+    #[test]
+    fn public_endpoint_brackets_ipv6_override() {
+        assert_eq!(
+            public_endpoint(Some("2001:db8::1"), "100.64.0.1:7835", 25565),
+            "[2001:db8::1]:25565"
+        );
     }
 
     #[tokio::test]
