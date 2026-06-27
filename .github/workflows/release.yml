@@ -85,8 +85,11 @@ jobs:
           tag="${{ needs.validate.outputs.tag }}"
           asset_base="porthole-${tag}-${TARGET}"
 
-          mkdir -p dist "${asset_base}"
+          mkdir -p dist "${asset_base}/config" "${asset_base}/systemd"
           install -m 0755 "target/${TARGET}/release/porthole" "${asset_base}/porthole"
+          install -m 0644 README.md "${asset_base}/README.md"
+          install -m 0644 config/*.example.toml "${asset_base}/config/"
+          install -m 0644 porthole.service "${asset_base}/systemd/porthole.service"
 
           tar -czf "dist/${asset_base}.tar.gz" "${asset_base}"
           (
@@ -134,8 +137,11 @@ jobs:
           $archive = "dist\$assetBase.zip"
           $checksum = "$archive.sha256"
 
-          New-Item -ItemType Directory -Force -Path "dist", $assetBase | Out-Null
+          New-Item -ItemType Directory -Force -Path "dist", $assetBase, "$assetBase\config", "$assetBase\systemd" | Out-Null
           Copy-Item "target\release\porthole.exe" "$assetBase\porthole.exe"
+          Copy-Item "README.md" "$assetBase\README.md"
+          Copy-Item "config\*.example.toml" "$assetBase\config"
+          Copy-Item "porthole.service" "$assetBase\systemd\porthole.service"
 
           Compress-Archive -Path $assetBase -DestinationPath $archive -Force
 
