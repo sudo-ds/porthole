@@ -22,3 +22,11 @@ max_port = 20000
 # fingerprint is printed at startup — pin it on the client.
 cert_path = "porthole.crt"
 key_path = "porthole.key"
+
+# Logging. By default, porthole writes console output and daily rotated files
+# under ./Logs, keeping the newest 14 files. RUST_LOG or -v/-vv override level.
+[logging]
+mode = "both"       # both | console | file | off
+level = "info"
+directory = "Logs"
+max_files = 14      # 0 disables pruning

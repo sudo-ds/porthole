@@ -495,6 +495,7 @@ async fn first_run_setup(args: &ServerArgs) -> Result<ServerSettings> {
         cert_path: Some("porthole.crt".into()),
         key_path: Some("porthole.key".into()),
         public_host: Some(host),
+        logging: Default::default(),
     };
     let path = config::default_server_config_path();
     config::save_server_file(&path, &file)?;

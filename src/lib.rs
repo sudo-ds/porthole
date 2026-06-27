@@ -9,6 +9,7 @@ pub mod cli;
 pub mod client;
 pub mod config;
 pub mod invite;
+pub mod logging;
 pub mod net;
 pub mod protocol;
 pub mod server;

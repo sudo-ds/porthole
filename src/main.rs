@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use porthole::cli::{Cli, Command};
-use porthole::{banner, client, config, install_crypto_provider, server, service, tui};
+use porthole::{banner, client, config, install_crypto_provider, logging, server, service, tui};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
     let dashboard = !cli.no_banner
         && std::io::stdout().is_terminal()
         && matches!(cli.command, Command::Client(_) | Command::Join(_));
-    init_tracing(cli.verbose, dashboard);
+    let _logging = logging::init_cli(&cli, dashboard)?;
     if dashboard {
         tui::set_enabled(true);
     }
@@ -47,28 +47,5 @@ async fn main() -> Result<()> {
             porthole::cli::ServiceCommand::Uninstall(args) => service::uninstall(args),
             porthole::cli::ServiceCommand::Run(args) => service::run(args),
         },
-    }
-}
-
-fn init_tracing(verbose: u8, to_buffer: bool) {
-    use tracing_subscriber::EnvFilter;
-    let filter = match verbose {
-        0 => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        1 => EnvFilter::new("porthole=debug,info"),
-        _ => EnvFilter::new("porthole=trace,debug"),
-    };
-    if to_buffer {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(false)
-            .with_ansi(false)
-            .without_time()
-            .with_writer(tui::make_writer())
-            .init();
-    } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(false)
-            .init();
     }
 }

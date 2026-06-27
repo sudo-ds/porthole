@@ -101,7 +101,7 @@ On an interactive terminal the client shows a live dashboard:
        .-"""""-.
      .'  o o o  '.        ... (purple logo) ...
        '-.....-'
-  client · v0.2.1
+  client · v0.3.0
 
   ● connected to 10xdev.sk:7835    public ports 1024-65535
 
@@ -139,6 +139,19 @@ porthole gen-token
   `--secret-file`, or a `secret = "..."` entry in the client config instead of `join`.
 - Config files (`porthole-server.toml`, `porthole-client.toml`) are created next to the binary
   and updated as you change tunnels or pause/unpause them. See `config/*.example.toml`.
+- `porthole server`, `porthole client`, and `porthole join` write daily rotated logs to
+  `Logs/` under the process working directory by default, while keeping console/dashboard
+  output enabled. Configure this in either TOML file:
+
+```toml
+[logging]
+mode = "both"       # both | console | file | off
+level = "info"      # RUST_LOG and -v/-vv override this
+directory = "Logs"  # relative to the working directory unless absolute
+max_files = 14      # 0 disables pruning
+```
+
+Log level precedence is `-v`/`-vv`, then `RUST_LOG`, then `logging.level`, then `info`.
 
 ## Windows service
 
@@ -151,8 +164,9 @@ porthole service install client --config C:\porthole\client.toml --working-dir C
 
 `--working-dir` defaults to the directory containing `porthole.exe`. If `--config` is omitted,
 the service uses `porthole-server.toml` or `porthole-client.toml` inside that working directory.
-Create the config file before using `--start`. The services are installed as `porthole-server` and
-`porthole-client`, set to start automatically, and can be removed with:
+Logs default to the `Logs` folder inside that working directory. Create the config file before
+using `--start`. The services are installed as `porthole-server` and `porthole-client`, set to
+start automatically, and can be removed with:
 
 ```powershell
 porthole service uninstall server
@@ -207,8 +221,9 @@ sudo systemctl enable --now porthole
 ```
 
 The packaged unit runs `porthole server --config /etc/porthole/server.toml`, so that file must
-exist before the service starts. To print a client connection code from the same config, secret,
-and TLS certificate used by systemd:
+exist before the service starts. Its default rotated log files are written under
+`/var/lib/porthole/Logs`. To print a client connection code from the same config, secret, and TLS
+certificate used by systemd:
 
 ```sh
 sudo sh -c 'set -a; . /etc/porthole/porthole.env; set +a; cd /var/lib/porthole && /usr/local/bin/porthole server --config /etc/porthole/server.toml --show-invite'

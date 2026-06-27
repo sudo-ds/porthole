@@ -5,7 +5,6 @@ Wants=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/porthole server --config /etc/porthole/server.toml
-Environment=RUST_LOG=info
 # Put PORTHOLE_SECRET=... in this file (chmod 600) to keep it out of argv/ps.
 EnvironmentFile=/etc/porthole/porthole.env
 Restart=always

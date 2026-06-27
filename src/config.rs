@@ -12,6 +12,65 @@ use crate::protocol::{Proto, DEFAULT_CONTROL_PORT, DEFAULT_WEB_BIND};
 pub const ENV_SECRET: &str = "PORTHOLE_SECRET";
 
 // ---------------------------------------------------------------------------
+// Logging config (shared by server and client)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogMode {
+    #[default]
+    Both,
+    Console,
+    File,
+    Off,
+}
+
+impl LogMode {
+    pub fn console_enabled(self) -> bool {
+        matches!(self, Self::Both | Self::Console)
+    }
+
+    pub fn file_enabled(self) -> bool {
+        matches!(self, Self::Both | Self::File)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoggingConfig {
+    #[serde(default)]
+    pub mode: LogMode,
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    #[serde(default = "default_log_directory")]
+    pub directory: PathBuf,
+    #[serde(default = "default_log_max_files")]
+    pub max_files: usize,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            mode: LogMode::default(),
+            level: default_log_level(),
+            directory: default_log_directory(),
+            max_files: default_log_max_files(),
+        }
+    }
+}
+
+fn default_log_level() -> String {
+    "info".into()
+}
+
+fn default_log_directory() -> PathBuf {
+    "Logs".into()
+}
+
+fn default_log_max_files() -> usize {
+    14
+}
+
+// ---------------------------------------------------------------------------
 // Tunnel definition (shared between config file and runtime)
 // ---------------------------------------------------------------------------
 
@@ -77,6 +136,8 @@ pub struct ServerFile {
     /// Public address clients dial (used to build the connection code).
     #[serde(default)]
     pub public_host: Option<String>,
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +223,8 @@ pub struct ClientFile {
     pub tunnels_paused: bool,
     /// Persisted only if present here (a secret sourced from env stays out of the file).
     pub secret: Option<String>,
+    #[serde(default)]
+    pub logging: LoggingConfig,
     #[serde(default, rename = "tunnels")]
     pub tunnels: Vec<TunnelConfig>,
 }
@@ -225,6 +288,14 @@ pub fn load_client(args: &ClientArgs) -> Result<ClientSettings> {
     })
 }
 
+/// Load only the shared `[logging]` table from a TOML file.
+pub fn load_logging(path: Option<&Path>) -> Result<LoggingConfig> {
+    let Some(path) = path else {
+        return Ok(LoggingConfig::default());
+    };
+    logging_from_str(&read_file(path)?).with_context(|| format!("parsing {}", path.display()))
+}
+
 /// Serialize a [`ClientFile`] to its config path atomically (temp file + rename).
 pub fn save_client_file(path: &Path, file: &ClientFile) -> Result<()> {
     let toml = toml::to_string_pretty(file).context("serializing client config")?;
@@ -281,6 +352,14 @@ pub fn gen_secret() -> String {
 
 fn read_file(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+}
+
+fn logging_from_str(text: &str) -> Result<LoggingConfig> {
+    let root: toml::Value = toml::from_str(text).context("parsing TOML")?;
+    let Some(logging) = root.get("logging") else {
+        return Ok(LoggingConfig::default());
+    };
+    logging.clone().try_into().context("parsing [logging]")
 }
 
 /// Resolve the shared secret: --secret-file > $PORTHOLE_SECRET > config `secret`.
@@ -351,5 +430,49 @@ server_fingerprint = "sha256:test"
         assert!(toml.contains("tunnels_paused = true"));
         let back: ClientFile = toml::from_str(&toml).unwrap();
         assert!(back.tunnels_paused);
+    }
+
+    #[test]
+    fn logging_defaults_when_table_is_absent() {
+        let logging = logging_from_str("server_addr = \"example.com:7835\"").unwrap();
+        assert_eq!(logging, LoggingConfig::default());
+    }
+
+    #[test]
+    fn logging_partial_table_uses_defaults() {
+        let logging = logging_from_str(
+            r#"
+[logging]
+mode = "file"
+"#,
+        )
+        .unwrap();
+        assert_eq!(logging.mode, LogMode::File);
+        assert_eq!(logging.level, "info");
+        assert_eq!(logging.directory, PathBuf::from("Logs"));
+        assert_eq!(logging.max_files, 14);
+    }
+
+    #[test]
+    fn logging_rejects_invalid_mode() {
+        assert!(logging_from_str(
+            r#"
+[logging]
+mode = "sideways"
+"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn logging_accepts_zero_max_files() {
+        let logging = logging_from_str(
+            r#"
+[logging]
+max_files = 0
+"#,
+        )
+        .unwrap();
+        assert_eq!(logging.max_files, 0);
     }
 }

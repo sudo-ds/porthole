@@ -20,7 +20,7 @@ use windows_service::{
 use crate::cli::{
     ClientArgs, ServerArgs, ServiceInstallArgs, ServiceKind, ServiceRunArgs, ServiceUninstallArgs,
 };
-use crate::{client, config, server};
+use crate::{client, config, logging, server};
 
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
@@ -192,6 +192,7 @@ fn run_service() -> Result<()> {
             args.working_dir.display()
         )
     })?;
+    let _logging = logging::init_service(args.kind, &args.config, &args.working_dir)?;
 
     let shutdown = CancellationToken::new();
     let handler_shutdown = shutdown.clone();

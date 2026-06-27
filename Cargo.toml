@@ -1,6 +1,6 @@
 [package]
 name = "porthole"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Self-hosted TCP/UDP tunneling & relay service (a simple, self-hosted ngrok/playit.gg/bore alternative)"
 license = "MIT"
@@ -29,6 +29,7 @@ axum = "0.8"
 
 # Logging / errors
 tracing = "0.1"
+tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 anyhow = "1"
 thiserror = "2"
