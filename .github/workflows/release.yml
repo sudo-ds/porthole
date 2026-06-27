@@ -10,12 +10,15 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  TARGET: x86_64-unknown-linux-musl
 
 jobs:
-  release:
-    name: Release
+  validate:
+    name: Validate version
     runs-on: ubuntu-latest
+
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
 
     steps:
       - name: Checkout
@@ -25,12 +28,6 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-          rustup target add "${TARGET}"
-
-      - name: Install musl tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
 
       - name: Validate tag version
         id: version
@@ -52,6 +49,29 @@ jobs:
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
           echo "version=${tag_version}" >> "${GITHUB_OUTPUT}"
 
+  build-linux:
+    name: Build Linux
+    runs-on: ubuntu-latest
+    needs: validate
+
+    env:
+      TARGET: x86_64-unknown-linux-musl
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "${TARGET}"
+
+      - name: Install musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
       - name: Run tests
         run: cargo test --locked
 
@@ -59,11 +79,10 @@ jobs:
         run: cargo build --locked --release --target "${TARGET}"
 
       - name: Package release artifact
-        id: package
         run: |
           set -euo pipefail
 
-          tag="${{ steps.version.outputs.tag }}"
+          tag="${{ needs.validate.outputs.tag }}"
           asset_base="porthole-${tag}-${TARGET}"
 
           mkdir -p dist "${asset_base}"
@@ -75,17 +94,89 @@ jobs:
             sha256sum "${asset_base}.tar.gz" > "${asset_base}.tar.gz.sha256"
           )
 
-          echo "archive=dist/${asset_base}.tar.gz" >> "${GITHUB_OUTPUT}"
-          echo "checksum=dist/${asset_base}.tar.gz.sha256" >> "${GITHUB_OUTPUT}"
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: dist/*
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+    needs: validate
+
+    env:
+      TARGET: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Package release artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $tag = "${{ needs.validate.outputs.tag }}"
+          $assetBase = "porthole-$tag-$env:TARGET"
+          $archive = "dist\$assetBase.zip"
+          $checksum = "$archive.sha256"
+
+          New-Item -ItemType Directory -Force -Path "dist", $assetBase | Out-Null
+          Copy-Item "target\release\porthole.exe" "$assetBase\porthole.exe"
+
+          Compress-Archive -Path $assetBase -DestinationPath $archive -Force
+
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          "$hash  $assetBase.zip" | Set-Content -NoNewline -Encoding ascii $checksum
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs:
+      - validate
+      - build-linux
+      - build-windows
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          gh release create "${{ steps.version.outputs.tag }}" \
-            "${{ steps.package.outputs.archive }}" \
-            "${{ steps.package.outputs.checksum }}" \
-            --title "${{ steps.version.outputs.tag }}" \
-            --notes "Release ${{ steps.version.outputs.tag }}" \
+          set -euo pipefail
+
+          mapfile -t assets < <(find dist -type f | sort)
+
+          gh release create "${{ needs.validate.outputs.tag }}" \
+            "${assets[@]}" \
+            --title "${{ needs.validate.outputs.tag }}" \
+            --notes "Release ${{ needs.validate.outputs.tag }}" \
             --verify-tag \
             --latest
