@@ -2,6 +2,7 @@
 //! commands to the control loop (which owns config write-back); handlers never touch sockets
 //! or the config file directly.
 
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
@@ -128,10 +129,10 @@ async fn add_tunnel(State(st): State<AppState>, Json(req): Json<AddRequest>) -> 
         Ok(p) => p,
         Err(_) => return (StatusCode::BAD_REQUEST, "proto must be tcp or udp").into_response(),
     };
-    let local_addr = match req.local.parse() {
+    let local_addr = match parse_local_addr(&req.local) {
         Ok(a) => a,
         Err(_) => {
-            return (StatusCode::BAD_REQUEST, "local must be HOST:PORT").into_response();
+            return (StatusCode::BAD_REQUEST, "local must be HOST:PORT or PORT").into_response();
         }
     };
     // Validate the requested public port against the server's advertised range.
@@ -183,4 +184,41 @@ async fn pause_tunnels(State(st): State<AppState>) -> impl IntoResponse {
 async fn unpause_tunnels(State(st): State<AppState>) -> impl IntoResponse {
     let _ = st.cmd_tx.send(Command::SetPaused(false)).await;
     StatusCode::OK
+}
+
+fn parse_local_addr(local: &str) -> Result<SocketAddr, std::net::AddrParseError> {
+    let local = local.trim();
+    match local.parse::<SocketAddr>() {
+        Ok(addr) => Ok(addr),
+        Err(err) => match local.parse::<u16>() {
+            Ok(port) => Ok(SocketAddr::from(([127, 0, 0, 1], port))),
+            Err(_) => Err(err),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_local_addr_keeps_explicit_addr() {
+        assert_eq!(
+            parse_local_addr("192.0.2.10:4040").unwrap(),
+            "192.0.2.10:4040".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_local_addr_defaults_bare_port_to_loopback() {
+        assert_eq!(
+            parse_local_addr("4040").unwrap(),
+            "127.0.0.1:4040".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_local_addr_rejects_garbage() {
+        assert!(parse_local_addr("badaddr").is_err());
+    }
 }
