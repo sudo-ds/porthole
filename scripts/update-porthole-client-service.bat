@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal EnableExtensions EnableDelayedExpansion
 
 set "REPO=%REPO%"
 if "%REPO%"=="" set "REPO=sudo-ds/porthole"
@@ -46,7 +46,7 @@ if exist "%TMP%\sha-url.txt" (
   echo Verifying SHA256...
   powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$ErrorActionPreference='Stop';" ^
-    "Invoke-WebRequest -Uri '%SHA_URL%' -OutFile '%TMP%\porthole.zip.sha256';" ^
+    "Invoke-WebRequest -Uri '!SHA_URL!' -OutFile '%TMP%\porthole.zip.sha256';" ^
     "$expected = ((Get-Content -Raw '%TMP%\porthole.zip.sha256').Trim() -split '\s+')[0].ToLowerInvariant();" ^
     "$actual = (Get-FileHash -Algorithm SHA256 '%TMP%\porthole.zip').Hash.ToLowerInvariant();" ^
     "if ($expected -ne $actual) { throw ('SHA256 mismatch: expected ' + $expected + ', got ' + $actual) }"
