@@ -24,8 +24,10 @@ use uuid::Uuid;
 
 pub const DEFAULT_CONTROL_PORT: u16 = 7835;
 pub const DEFAULT_WEB_BIND: &str = "127.0.0.1:4040";
-/// Max length-delimited frame. Comfortably above the largest UDP datagram + header.
-pub const MAX_FRAME: usize = 64 * 1024;
+/// Max length-delimited frame. Must exceed the largest UDP datagram (`udp::MAX_DATAGRAM`,
+/// 65535) plus the 19-byte address header, or a maximum-size datagram would be rejected by
+/// the codec and tear down the whole channel. 64 KiB + slack covers it; control JSON is tiny.
+pub const MAX_FRAME: usize = 64 * 1024 + 256;
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);

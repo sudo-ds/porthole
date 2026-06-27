@@ -123,10 +123,11 @@ pub async fn run(settings: ServerSettings) -> Result<()> {
 impl Server {
     async fn handle_inbound(&self, tcp: TcpStream, peer: SocketAddr) -> Result<()> {
         net::set_keepalive(&tcp);
-        let tls = self
-            .acceptor
-            .accept(tcp)
+        // Bound the TLS handshake: a peer that completes the TCP connect but stalls the
+        // handshake would otherwise park this task indefinitely (slowloris-style).
+        let tls = tokio::time::timeout(NETWORK_TIMEOUT, self.acceptor.accept(tcp))
             .await
+            .context("tls handshake timed out")?
             .context("tls handshake failed")?;
         let mut wire = protocol::wire(tls);
 
@@ -160,7 +161,28 @@ impl Server {
             return Ok(());
         }
         if let Some((_, pending)) = self.udp_pending.remove(&id) {
-            return udp::server_forward(wire, pending.socket, pending.cancel).await;
+            let PendingUdp {
+                socket,
+                port,
+                session,
+                cancel,
+            } = pending;
+            let result = udp::server_forward(wire, socket.clone(), cancel.clone()).await;
+            // The data connection ended. If the tunnel is still alive (control up and the
+            // tunnel not unregistered), keep its public socket bound and the token valid so
+            // the client can re-dial the channel instead of losing the tunnel.
+            if !cancel.is_cancelled() {
+                self.udp_pending.insert(
+                    id,
+                    PendingUdp {
+                        socket,
+                        port,
+                        session,
+                        cancel,
+                    },
+                );
+            }
+            return result;
         }
         tracing::debug!("data connection for unknown/expired id {id}");
         Ok(())

@@ -175,6 +175,41 @@ async fn udp_tunnel_roundtrip() {
 }
 
 #[tokio::test]
+async fn udp_large_datagram_roundtrip() {
+    install();
+    let echo = udp_echo().await;
+    let (ingress, public) = (free_port(), free_port());
+    let tunnel = TunnelConfig {
+        name: "u".into(),
+        protocol: Proto::Udp,
+        local_addr: echo,
+        remote_port: Some(public),
+        enabled: true,
+    };
+    start_relay(ingress, public, "udp-large", tunnel);
+
+    let public_addr: SocketAddr = format!("127.0.0.1:{public}").parse().unwrap();
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // A large datagram exercises the framing path near MAX_FRAME (payload + address header);
+    // it must survive the round trip rather than tripping the codec's frame-length limit.
+    let payload = vec![0xABu8; 60_000];
+    let mut buf = vec![0u8; 65_535];
+    let mut got: Option<Vec<u8>> = None;
+    for _ in 0..100 {
+        let _ = sock.send_to(&payload, public_addr).await;
+        match tokio::time::timeout(Duration::from_millis(200), sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) => {
+                got = Some(buf[..n].to_vec());
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    assert_eq!(got.as_deref(), Some(payload.as_slice()));
+}
+
+#[tokio::test]
 async fn client_reconnects_when_server_starts_late() {
     install();
     let echo = tcp_echo().await;
