@@ -22,7 +22,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::cli::{ClientArgs, JoinArgs};
-use crate::config::{self, save_client_file, ClientFile, ClientSettings, TunnelConfig};
+use crate::config::{
+    self, save_client_file, ClientFile, ClientSettings, ProxyProtocol, TunnelConfig,
+};
 use crate::invite;
 use crate::protocol::{
     self, ClientMessage, Proto, ServerMessage, Wire, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT,
@@ -45,6 +47,7 @@ pub struct TunnelStatus {
     pub proto: Proto,
     pub local_addr: SocketAddr,
     pub remote_port: Option<u16>,
+    pub proxy_protocol: ProxyProtocol,
     pub enabled: AtomicBool,
     pub public_addr: Mutex<Option<String>>,
     pub up: AtomicBool,
@@ -267,6 +270,7 @@ fn status_from(t: &TunnelConfig) -> TunnelStatus {
         proto: t.protocol,
         local_addr: t.local_addr,
         remote_port: t.remote_port,
+        proxy_protocol: t.proxy_protocol,
         enabled: AtomicBool::new(t.enabled),
         public_addr: Mutex::new(None),
         up: AtomicBool::new(false),
@@ -276,8 +280,14 @@ fn status_from(t: &TunnelConfig) -> TunnelStatus {
 }
 
 fn ensure_status(shared: &ClientShared, t: &TunnelConfig) {
-    match shared.status.get(&t.name) {
-        Some(s) => s.enabled.store(t.enabled, Relaxed),
+    match shared.status.get_mut(&t.name) {
+        Some(mut s) => {
+            s.proto = t.protocol;
+            s.local_addr = t.local_addr;
+            s.remote_port = t.remote_port;
+            s.proxy_protocol = t.proxy_protocol;
+            s.enabled.store(t.enabled, Relaxed);
+        }
         None => {
             shared.status.insert(t.name.clone(), status_from(t));
         }
@@ -424,11 +434,18 @@ async fn connect_and_run(shared: &Arc<ClientShared>) -> Result<()> {
                 }) => {
                     apply_accepted(shared, &conn_cancel, name, proto, remote_port, token);
                 }
-                Ok(ServerMessage::NewConn { id, tunnel }) => {
+                Ok(ServerMessage::NewConn {
+                    id,
+                    tunnel,
+                    src_addr,
+                    dst_addr,
+                }) => {
                     tokio::spawn(tcp::client_handle_conn(
                         shared.clone(),
                         id,
                         tunnel,
+                        src_addr,
+                        dst_addr,
                         conn_cancel.clone(),
                     ));
                 }
@@ -769,6 +786,7 @@ mod tests {
             local_addr: "127.0.0.1:25565".parse().unwrap(),
             remote_port: Some(25565),
             enabled: true,
+            proxy_protocol: ProxyProtocol::Off,
         };
         let existing = ClientFile {
             web_bind: Some("127.0.0.1:4041".into()),
@@ -838,6 +856,7 @@ mod tests {
             local_addr: "127.0.0.1:25565".parse().unwrap(),
             remote_port: Some(25565),
             enabled: true,
+            proxy_protocol: ProxyProtocol::Off,
         };
         let disabled = TunnelConfig {
             name: "disabled".into(),
@@ -845,6 +864,7 @@ mod tests {
             local_addr: "127.0.0.1:25566".parse().unwrap(),
             remote_port: Some(25566),
             enabled: false,
+            proxy_protocol: ProxyProtocol::Off,
         };
         let file = ClientFile {
             tunnels: vec![enabled.clone(), disabled],

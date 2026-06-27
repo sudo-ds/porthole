@@ -85,13 +85,59 @@ pub struct TunnelConfig {
     pub remote_port: Option<u16>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "ProxyProtocol::is_off")]
+    pub proxy_protocol: ProxyProtocol,
 }
 
 fn default_true() -> bool {
     true
 }
 
-/// Parse a `name=proto:LOCAL->REMOTE` CLI spec.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyProtocol {
+    #[default]
+    Off,
+    V1,
+    V2,
+}
+
+impl ProxyProtocol {
+    pub fn is_off(&self) -> bool {
+        matches!(self, Self::Off)
+    }
+}
+
+impl std::fmt::Display for ProxyProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => write!(f, "off"),
+            Self::V1 => write!(f, "v1"),
+            Self::V2 => write!(f, "v2"),
+        }
+    }
+}
+
+impl std::str::FromStr for ProxyProtocol {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "false" => Ok(Self::Off),
+            "v1" | "proxy-v1" | "proxy_v1" => Ok(Self::V1),
+            "v2" | "proxy-v2" | "proxy_v2" => Ok(Self::V2),
+            other => bail!("invalid proxy protocol {other:?} (expected `off`, `v1`, or `v2`)"),
+        }
+    }
+}
+
+pub fn validate_tunnel_config(t: &TunnelConfig) -> Result<()> {
+    if t.protocol == Proto::Udp && !t.proxy_protocol.is_off() {
+        bail!("proxy_protocol is only supported for tcp tunnels");
+    }
+    Ok(())
+}
+
+/// Parse a `name=proto:LOCAL->REMOTE[;proxy=v1|v2]` CLI spec.
 pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelConfig> {
     let (name, rest) = spec
         .split_once('=')
@@ -102,6 +148,29 @@ pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelConfig> {
     let (local, remote) = addrs
         .split_once("->")
         .with_context(|| format!("tunnel spec {spec:?} missing `LOCAL->REMOTE`"))?;
+    let mut remote_parts = remote.split(';');
+    let remote = remote_parts.next().unwrap_or_default();
+    let mut proxy_protocol = ProxyProtocol::Off;
+    let mut proxy_set = false;
+    for opt in remote_parts {
+        let opt = opt.trim();
+        if opt.is_empty() {
+            bail!("empty tunnel option in {spec:?}");
+        }
+        let (key, value) = opt
+            .split_once('=')
+            .with_context(|| format!("invalid tunnel option {opt:?} in {spec:?}"))?;
+        match key.trim() {
+            "proxy" | "proxy_protocol" => {
+                if proxy_set {
+                    bail!("duplicate proxy option in {spec:?}");
+                }
+                proxy_protocol = value.parse()?;
+                proxy_set = true;
+            }
+            other => bail!("unknown tunnel option {other:?} in {spec:?}"),
+        }
+    }
     let protocol: Proto = proto.parse()?;
     let local_addr: SocketAddr = local
         .trim()
@@ -111,13 +180,16 @@ pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelConfig> {
         .trim()
         .parse()
         .with_context(|| format!("invalid remote port {remote:?} in {spec:?}"))?;
-    Ok(TunnelConfig {
+    let t = TunnelConfig {
         name: name.trim().to_string(),
         protocol,
         local_addr,
         remote_port: (remote_port != 0).then_some(remote_port),
         enabled: true,
-    })
+        proxy_protocol,
+    };
+    validate_tunnel_config(&t)?;
+    Ok(t)
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +333,9 @@ pub fn load_client(args: &ClientArgs) -> Result<ClientSettings> {
     for spec in &args.tunnels {
         file.tunnels.push(parse_tunnel_spec(spec)?);
     }
+    for t in &file.tunnels {
+        validate_tunnel_config(t).with_context(|| format!("invalid tunnel '{}'", t.name))?;
+    }
 
     let secret = resolve_secret(args.secret_file.as_deref(), file.secret.as_deref())?;
 
@@ -402,6 +477,7 @@ mod tests {
         assert_eq!(t.local_addr, "127.0.0.1:25565".parse().unwrap());
         assert_eq!(t.remote_port, Some(25565));
         assert!(t.enabled);
+        assert_eq!(t.proxy_protocol, ProxyProtocol::Off);
     }
 
     #[test]
@@ -409,6 +485,13 @@ mod tests {
         let t = parse_tunnel_spec("g=udp:127.0.0.1:19132->0").unwrap();
         assert_eq!(t.protocol, Proto::Udp);
         assert_eq!(t.remote_port, None);
+        assert_eq!(t.proxy_protocol, ProxyProtocol::Off);
+    }
+
+    #[test]
+    fn parse_spec_accepts_proxy_suffix() {
+        let t = parse_tunnel_spec("mc=tcp:127.0.0.1:25565->25565;proxy=v2").unwrap();
+        assert_eq!(t.proxy_protocol, ProxyProtocol::V2);
     }
 
     #[test]
@@ -416,6 +499,58 @@ mod tests {
         assert!(parse_tunnel_spec("nope").is_err());
         assert!(parse_tunnel_spec("a=tcp:badaddr->1").is_err());
         assert!(parse_tunnel_spec("a=ftp:127.0.0.1:1->2").is_err());
+        assert!(parse_tunnel_spec("a=tcp:127.0.0.1:1->2;banana=v1").is_err());
+        assert!(parse_tunnel_spec("a=udp:127.0.0.1:1->2;proxy=v1").is_err());
+    }
+
+    #[test]
+    fn tunnel_proxy_protocol_defaults_and_omits_off() {
+        let t: TunnelConfig = toml::from_str(
+            r#"
+name = "mc"
+protocol = "tcp"
+local_addr = "127.0.0.1:25565"
+remote_port = 25565
+"#,
+        )
+        .unwrap();
+        assert_eq!(t.proxy_protocol, ProxyProtocol::Off);
+
+        let text = toml::to_string(&t).unwrap();
+        assert!(!text.contains("proxy_protocol"));
+    }
+
+    #[test]
+    fn tunnel_proxy_protocol_serializes_non_off() {
+        let t: TunnelConfig = toml::from_str(
+            r#"
+name = "mc"
+protocol = "tcp"
+local_addr = "127.0.0.1:25565"
+remote_port = 25565
+proxy_protocol = "v1"
+"#,
+        )
+        .unwrap();
+        assert_eq!(t.proxy_protocol, ProxyProtocol::V1);
+        assert!(toml::to_string(&t)
+            .unwrap()
+            .contains("proxy_protocol = \"v1\""));
+    }
+
+    #[test]
+    fn validate_rejects_udp_proxy_protocol() {
+        let t: TunnelConfig = toml::from_str(
+            r#"
+name = "udp"
+protocol = "udp"
+local_addr = "127.0.0.1:19132"
+remote_port = 19132
+proxy_protocol = "v1"
+"#,
+        )
+        .unwrap();
+        assert!(validate_tunnel_config(&t).is_err());
     }
 
     #[test]

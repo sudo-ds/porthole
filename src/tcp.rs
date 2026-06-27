@@ -7,17 +7,20 @@
 //! Client: on `NewConn`, dial a data connection (identified by the same id) and the local
 //! target, then splice them.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
+use anyhow::{bail, Result};
 use dashmap::DashMap;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::client::ClientShared;
+use crate::config::ProxyProtocol;
 use crate::net;
 use crate::protocol::{self, Prefixed, ServerMessage, ACCEPT_TIMEOUT};
 use crate::server::ServerTls;
@@ -43,15 +46,18 @@ pub async fn server_listener(
         tokio::select! {
             _ = cancel.cancelled() => break,
             res = listener.accept() => {
-                let (user, _peer) = match res {
+                let (user, peer) = match res {
                     Ok(x) => x,
                     Err(e) => { tracing::debug!("accept on tunnel '{tunnel}': {e}"); break; }
                 };
                 net::set_keepalive(&user);
+                let dst = user.local_addr().ok();
 
                 accept_user_conn(
                     user,
                     tunnel.clone(),
+                    Some(peer),
+                    dst,
                     control_tx.clone(),
                     pending.clone(),
                     cancel.clone(),
@@ -65,6 +71,8 @@ pub async fn server_listener(
 async fn accept_user_conn<User, Data>(
     user: User,
     tunnel: String,
+    src_addr: Option<SocketAddr>,
+    dst_addr: Option<SocketAddr>,
     control_tx: mpsc::Sender<ServerMessage>,
     pending: PendingMapFor<Data>,
     cancel: CancellationToken,
@@ -77,7 +85,12 @@ async fn accept_user_conn<User, Data>(
     pending.insert(id, tx);
 
     if control_tx
-        .send(ServerMessage::NewConn { id, tunnel })
+        .send(ServerMessage::NewConn {
+            id,
+            tunnel,
+            src_addr,
+            dst_addr,
+        })
         .await
         .is_err()
     {
@@ -118,10 +131,12 @@ pub async fn client_handle_conn(
     shared: Arc<ClientShared>,
     id: Uuid,
     tunnel: String,
+    src_addr: Option<SocketAddr>,
+    dst_addr: Option<SocketAddr>,
     cancel: CancellationToken,
 ) {
-    let (local, counters) = match shared.status.get(&tunnel) {
-        Some(s) => (s.local_addr, s.counters.clone()),
+    let (local, proxy_protocol, counters) = match shared.status.get(&tunnel) {
+        Some(s) => (s.local_addr, s.proxy_protocol, s.counters.clone()),
         None => {
             tracing::warn!("NewConn for unknown tunnel '{tunnel}'");
             return;
@@ -146,6 +161,24 @@ pub async fn client_handle_conn(
     };
     net::set_keepalive(&local_stream);
 
+    if !proxy_protocol.is_off() {
+        let (Some(src), Some(dst)) = (src_addr, dst_addr) else {
+            tracing::warn!("proxy protocol enabled for '{tunnel}' but source metadata is missing");
+            return;
+        };
+        let header = match proxy_header(proxy_protocol, src, dst) {
+            Ok(header) => header,
+            Err(e) => {
+                tracing::warn!("proxy protocol header for '{tunnel}' could not be built: {e:#}");
+                return;
+            }
+        };
+        if let Err(e) = local_stream.write_all(&header).await {
+            tracing::warn!("writing proxy protocol header to local service {local}: {e}");
+            return;
+        }
+    }
+
     counters.active.fetch_add(1, Relaxed);
     tokio::select! {
         _ = cancel.cancelled() => {}
@@ -157,6 +190,56 @@ pub async fn client_handle_conn(
         }
     }
     counters.active.fetch_sub(1, Relaxed);
+}
+
+fn proxy_header(mode: ProxyProtocol, src: SocketAddr, dst: SocketAddr) -> Result<Vec<u8>> {
+    match mode {
+        ProxyProtocol::Off => Ok(Vec::new()),
+        ProxyProtocol::V1 => proxy_header_v1(src, dst),
+        ProxyProtocol::V2 => proxy_header_v2(src, dst),
+    }
+}
+
+fn proxy_header_v1(src: SocketAddr, dst: SocketAddr) -> Result<Vec<u8>> {
+    let family = match (src.ip(), dst.ip()) {
+        (IpAddr::V4(_), IpAddr::V4(_)) => "TCP4",
+        (IpAddr::V6(_), IpAddr::V6(_)) => "TCP6",
+        _ => bail!("source and destination address families differ"),
+    };
+    Ok(format!(
+        "PROXY {family} {} {} {} {}\r\n",
+        src.ip(),
+        dst.ip(),
+        src.port(),
+        dst.port()
+    )
+    .into_bytes())
+}
+
+fn proxy_header_v2(src: SocketAddr, dst: SocketAddr) -> Result<Vec<u8>> {
+    const SIG: &[u8; 12] = b"\r\n\r\n\0\r\nQUIT\n";
+
+    let mut out = Vec::with_capacity(52);
+    out.extend_from_slice(SIG);
+    out.push(0x21); // version 2, PROXY command
+    match (src.ip(), dst.ip()) {
+        (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) => {
+            out.push(0x11); // AF_INET, STREAM
+            out.extend_from_slice(&12u16.to_be_bytes());
+            out.extend_from_slice(&src_ip.octets());
+            out.extend_from_slice(&dst_ip.octets());
+        }
+        (IpAddr::V6(src_ip), IpAddr::V6(dst_ip)) => {
+            out.push(0x21); // AF_INET6, STREAM
+            out.extend_from_slice(&36u16.to_be_bytes());
+            out.extend_from_slice(&src_ip.octets());
+            out.extend_from_slice(&dst_ip.octets());
+        }
+        _ => bail!("source and destination address families differ"),
+    }
+    out.extend_from_slice(&src.port().to_be_bytes());
+    out.extend_from_slice(&dst.port().to_be_bytes());
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -177,16 +260,26 @@ mod tests {
         accept_user_conn(
             server_side,
             "mock-tunnel".into(),
+            Some("203.0.113.7:51820".parse().unwrap()),
+            Some("198.51.100.10:25565".parse().unwrap()),
             control_tx,
             pending.clone(),
             cancel.clone(),
         )
         .await;
 
-        let ServerMessage::NewConn { id, tunnel } = control_rx.recv().await.unwrap() else {
+        let ServerMessage::NewConn {
+            id,
+            tunnel,
+            src_addr,
+            dst_addr,
+        } = control_rx.recv().await.unwrap()
+        else {
             panic!("expected NewConn");
         };
         assert_eq!(tunnel, "mock-tunnel");
+        assert_eq!(src_addr, Some("203.0.113.7:51820".parse().unwrap()));
+        assert_eq!(dst_addr, Some("198.51.100.10:25565".parse().unwrap()));
         assert!(pending.contains_key(&id));
 
         let (mut client_data, server_data) = duplex(4096);
@@ -224,6 +317,8 @@ mod tests {
         accept_user_conn(
             server_side,
             "mock-tunnel".into(),
+            None,
+            None,
             control_tx,
             pending.clone(),
             cancel.clone(),
@@ -243,5 +338,56 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn proxy_v1_header_ipv4_is_exact() {
+        let src = "203.0.113.7:51820".parse().unwrap();
+        let dst = "198.51.100.10:25565".parse().unwrap();
+        let header = proxy_header(ProxyProtocol::V1, src, dst).unwrap();
+        assert_eq!(
+            header,
+            b"PROXY TCP4 203.0.113.7 198.51.100.10 51820 25565\r\n"
+        );
+    }
+
+    #[test]
+    fn proxy_v1_header_ipv6_is_exact() {
+        let src = "[2001:db8::1]:51820".parse().unwrap();
+        let dst = "[2001:db8::2]:25565".parse().unwrap();
+        let header = proxy_header(ProxyProtocol::V1, src, dst).unwrap();
+        assert_eq!(
+            header,
+            b"PROXY TCP6 2001:db8::1 2001:db8::2 51820 25565\r\n"
+        );
+    }
+
+    #[test]
+    fn proxy_v2_header_ipv4_is_exact() {
+        let src = "203.0.113.7:51820".parse().unwrap();
+        let dst = "198.51.100.10:25565".parse().unwrap();
+        let header = proxy_header(ProxyProtocol::V2, src, dst).unwrap();
+        assert_eq!(
+            header,
+            vec![
+                0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a, 0x21, 0x11,
+                0x00, 0x0c, 203, 0, 113, 7, 198, 51, 100, 10, 0xca, 0x6c, 0x63, 0xdd,
+            ]
+        );
+    }
+
+    #[test]
+    fn proxy_v2_header_ipv6_is_exact() {
+        let src = "[2001:db8::1]:51820".parse().unwrap();
+        let dst = "[2001:db8::2]:25565".parse().unwrap();
+        let header = proxy_header(ProxyProtocol::V2, src, dst).unwrap();
+        assert_eq!(
+            header,
+            vec![
+                0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a, 0x21, 0x21,
+                0x00, 0x24, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x20, 0x01,
+                0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0xca, 0x6c, 0x63, 0xdd,
+            ]
+        );
     }
 }

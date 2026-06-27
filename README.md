@@ -17,6 +17,7 @@ A simple, self-hosted TCP/UDP tunneling & relay — a tiny alternative to playit
 public internet through a server you control (e.g. a $5 VPS).
 
 - **TCP and UDP** tunnels
+- Optional TCP source IP forwarding with **PROXY protocol v1/v2**
 - **Share one connection code** — no certs, fingerprints, or config files to hand-edit
 - **Live terminal dashboard** (logo + stats + logs) and an **interactive web UI**
 - **TLS everywhere** with certificate pinning + a shared token — secure by default
@@ -101,7 +102,7 @@ On an interactive terminal the client shows a live dashboard:
        .-"""""-.
      .'  o o o  '.        ... (purple logo) ...
        '-.....-'
-  client · v0.3.2
+  client · v0.4.0
 
   ● connected to 10xdev.sk:7835    public ports 1024-65535
 
@@ -191,7 +192,40 @@ PORTHOLE_SECRET=... porthole client \
   --tunnel mc=tcp:127.0.0.1:25565->25565
 ```
 
-`--tunnel` spec is `name=proto:LOCAL->REMOTE` (use REMOTE `0` for a server-assigned port).
+`--tunnel` spec is `name=proto:LOCAL->REMOTE[;proxy=v1|v2]` (use REMOTE `0` for a
+server-assigned port).
+
+### TCP source IP forwarding
+
+By default your local service sees incoming TCP connections as coming from the porthole client
+machine, usually `127.0.0.1` or a LAN address. For TCP services that explicitly support the
+[HAProxy PROXY protocol](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt), enable
+source IP forwarding per tunnel:
+
+```toml
+[[tunnels]]
+name = "minecraft"
+protocol = "tcp"
+local_addr = "127.0.0.1:25565"
+remote_port = 25565
+proxy_protocol = "v1" # off | v1 | v2
+```
+
+Or from the CLI:
+
+```sh
+porthole client ... --tunnel 'mc=tcp:127.0.0.1:25565->25565;proxy=v1'
+```
+
+The web UI exposes the same setting as a TCP-only advanced option when adding a tunnel, and
+shows a PROXY badge for tunnels using it.
+
+Only enable this if the upstream service is configured to accept PROXY protocol. Incompatible
+servers will receive the PROXY header before the normal game/application traffic and will often
+drop the connection. Also make sure the upstream service only accepts PROXY protocol from the
+trusted porthole client address, such as `127.0.0.1` or a private LAN IP; otherwise direct
+callers could spoof client IPs by sending their own PROXY header. UDP tunnels do not support
+this option.
 
 ## Build
 

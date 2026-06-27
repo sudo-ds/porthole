@@ -21,6 +21,9 @@
   th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; }
   td.public a { color:var(--accent); text-decoration:none; }
   td.public .public-endpoint { display:inline-flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  td.actions { width:150px; }
+  .action-buttons { display:grid; grid-template-columns:68px 68px; gap:8px; align-items:center; }
+  .action-buttons button { width:100%; text-align:center; }
   .pill { font-size:11px; padding:2px 8px; border-radius:10px; border:1px solid var(--line); color:var(--muted); }
   .toolbar { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:12px; }
   .state { display:flex; align-items:center; gap:8px; color:var(--muted); }
@@ -28,6 +31,8 @@
   .err { color:var(--down); font-size:12px; }
   .hint { color:var(--muted); font-weight:normal; }
   .tcp { color:#79c0ff; } .udp { color:#d2a8ff; }
+  .proto-cell { display:flex; align-items:center; gap:6px; }
+  .proxy-badge { color:#ffa657; border-color:#6e4d1f; }
   button { background:var(--panel); color:var(--fg); border:1px solid var(--line);
            border-radius:6px; padding:5px 10px; cursor:pointer; font:inherit; }
   button:hover { border-color:var(--accent); }
@@ -72,9 +77,10 @@
   <h2>Add tunnel</h2>
   <form id="add">
     <label>Name<input name="name" placeholder="minecraft" required></label>
-    <label>Proto<select name="proto"><option>tcp</option><option>udp</option></select></label>
+    <label>Proto<select id="protoSelect" name="proto"><option>tcp</option><option>udp</option></select></label>
     <label>Local address<input name="local" placeholder="25565 or 127.0.0.1:25565" required></label>
     <label>Public port <small id="range" class="hint"></small><input name="remote_port" type="number" min="0" max="65535" placeholder="25565"></label>
+    <label id="proxyLabel">Proxy<select name="proxy_protocol"><option value="off">Off</option><option value="v1">PROXY v1</option><option value="v2">PROXY v2</option></select></label>
     <button type="submit">Add</button>
   </form>
 </main>
@@ -134,17 +140,20 @@ async function refresh() {
               : t.error ? `<span class="err" title="${t.error}">${t.error}</span>`
               : t.public ? `<span class="public-endpoint"><a href="//${publicText}">${publicText}</a><button type="button" class="copy-btn" data-copy="${publicText}" title="Copy public address">copy</button></span>`
               : '<span class="pill">pending</span>';
+    const proxyBadge = t.proto === 'tcp' && t.proxy_protocol && t.proxy_protocol !== 'off'
+      ? `<span class="pill proxy-badge">PROXY ${escapeHtml(t.proxy_protocol)}</span>`
+      : '';
     const en = t.enabled ? 'disable' : 'enable';
     tr.innerHTML =
       `<td>${dot} ${t.name}</td>` +
-      `<td class="${t.proto}">${t.proto}</td>` +
+      `<td class="${t.proto}"><span class="proto-cell">${t.proto}${proxyBadge}</span></td>` +
       `<td>${t.local}</td>` +
       `<td class="public">${pub}</td>` +
       `<td>${fmtBytes(t.bytes_in)}</td>` +
       `<td>${fmtBytes(t.bytes_out)}</td>` +
       `<td>${t.active}</td>` +
-      `<td><button data-toggle="${t.name}">${en}</button> ` +
-      `<button class="danger" data-remove="${t.name}">remove</button></td>`;
+      `<td class="actions"><span class="action-buttons"><button data-toggle="${t.name}">${en}</button>` +
+      `<button class="danger" data-remove="${t.name}">remove</button></span></td>`;
     rows.appendChild(tr);
   }
 }
@@ -171,16 +180,29 @@ document.getElementById('pauseBtn').addEventListener('click', async e => {
   await fetch(paused ? '/api/tunnels/unpause' : '/api/tunnels/pause', {method:'POST'});
   refresh();
 });
+function syncProxyControl() {
+  const proto = document.getElementById('protoSelect').value;
+  const label = document.getElementById('proxyLabel');
+  const select = label.querySelector('select');
+  const tcp = proto === 'tcp';
+  label.hidden = !tcp;
+  select.disabled = !tcp;
+  if (!tcp) select.value = 'off';
+}
+document.getElementById('protoSelect').addEventListener('change', syncProxyControl);
 document.getElementById('add').addEventListener('submit', async e => {
   e.preventDefault();
   const f = new FormData(e.target);
   const body = { name: f.get('name'), proto: f.get('proto'), local: f.get('local') };
   const rp = f.get('remote_port');
   if (rp) body.remote_port = parseInt(rp, 10);
+  const pp = f.get('proxy_protocol');
+  if (pp && pp !== 'off') body.proxy_protocol = pp;
   const res = await fetch('/api/tunnels', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  if (res.ok) { e.target.reset(); refresh(); }
+  if (res.ok) { e.target.reset(); syncProxyControl(); refresh(); }
   else alert(await res.text());
 });
+syncProxyControl();
 refresh();
 setInterval(refresh, 1500);
 </script>

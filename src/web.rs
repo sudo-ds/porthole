@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::client::{ClientShared, Command};
-use crate::config::TunnelConfig;
+use crate::config::{self, TunnelConfig};
 use crate::protocol::Proto;
 
 #[derive(Clone)]
@@ -69,6 +69,7 @@ struct TunnelView {
     proto: String,
     local: String,
     remote_port: Option<u16>,
+    proxy_protocol: String,
     public: Option<String>,
     enabled: bool,
     up: bool,
@@ -90,6 +91,7 @@ async fn status(State(st): State<AppState>) -> Json<StatusResponse> {
                 proto: s.proto.to_string(),
                 local: s.local_addr.to_string(),
                 remote_port: s.remote_port,
+                proxy_protocol: s.proxy_protocol.to_string(),
                 public: s.public_addr.lock().unwrap().clone(),
                 enabled: s.enabled.load(Relaxed),
                 up: s.up.load(Relaxed),
@@ -119,6 +121,7 @@ struct AddRequest {
     proto: String,
     local: String,
     remote_port: Option<u16>,
+    proxy_protocol: Option<String>,
 }
 
 async fn add_tunnel(State(st): State<AppState>, Json(req): Json<AddRequest>) -> impl IntoResponse {
@@ -133,6 +136,16 @@ async fn add_tunnel(State(st): State<AppState>, Json(req): Json<AddRequest>) -> 
         Ok(a) => a,
         Err(_) => {
             return (StatusCode::BAD_REQUEST, "local must be HOST:PORT or PORT").into_response();
+        }
+    };
+    let proxy_protocol = match req.proxy_protocol.as_deref().unwrap_or("off").parse() {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "proxy_protocol must be off, v1, or v2",
+            )
+                .into_response();
         }
     };
     // Validate the requested public port against the server's advertised range.
@@ -155,7 +168,11 @@ async fn add_tunnel(State(st): State<AppState>, Json(req): Json<AddRequest>) -> 
         local_addr,
         remote_port: req.remote_port.filter(|p| *p != 0),
         enabled: true,
+        proxy_protocol,
     };
+    if let Err(e) = config::validate_tunnel_config(&tunnel) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
     let _ = st.cmd_tx.send(Command::Add(tunnel)).await;
     (StatusCode::OK, "ok").into_response()
 }

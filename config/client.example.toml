@@ -35,6 +35,8 @@ name = "minecraft"
 protocol = "tcp"
 local_addr = "127.0.0.1:25565"
 remote_port = 25565
+# Optional TCP-only source IP forwarding for services that support PROXY protocol.
+# proxy_protocol = "v1"   # off | v1 | v2
 
 [[tunnels]]
 name = "valheim"

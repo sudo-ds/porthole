@@ -5,11 +5,12 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use porthole::config::{ClientFile, ClientSettings, ServerSettings, TunnelConfig};
+use porthole::config::{ClientFile, ClientSettings, ProxyProtocol, ServerSettings, TunnelConfig};
 use porthole::protocol::{self, ClientMessage, Proto, ServerMessage};
 use porthole::{client, server, tls};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::oneshot;
 
 fn install() {
     let _ = porthole::install_crypto_provider();
@@ -60,6 +61,122 @@ async fn tcp_echo() -> SocketAddr {
         }
     });
     addr
+}
+
+async fn tcp_proxy_echo(
+    mode: ProxyProtocol,
+    expected_public_port: u16,
+) -> (
+    SocketAddr,
+    oneshot::Receiver<std::result::Result<(), String>>,
+) {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let (report_tx, report_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let Ok((mut s, _)) = l.accept().await else {
+            let _ = report_tx.send(Err("proxy test server accept failed".into()));
+            return;
+        };
+        let result = verify_proxy_header(&mut s, mode, expected_public_port).await;
+        let ok = result.is_ok();
+        let _ = report_tx.send(result);
+        if !ok {
+            return;
+        }
+
+        let mut buf = [0u8; 4096];
+        loop {
+            match s.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if s.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    (addr, report_rx)
+}
+
+async fn verify_proxy_header(
+    s: &mut TcpStream,
+    mode: ProxyProtocol,
+    expected_public_port: u16,
+) -> std::result::Result<(), String> {
+    match mode {
+        ProxyProtocol::V1 => verify_proxy_v1(s, expected_public_port).await,
+        ProxyProtocol::V2 => verify_proxy_v2(s, expected_public_port).await,
+        ProxyProtocol::Off => Err("proxy mode must be v1 or v2".into()),
+    }
+}
+
+async fn verify_proxy_v1(
+    s: &mut TcpStream,
+    expected_public_port: u16,
+) -> std::result::Result<(), String> {
+    let mut line = Vec::new();
+    let mut one = [0u8; 1];
+    loop {
+        s.read_exact(&mut one).await.map_err(|e| e.to_string())?;
+        line.push(one[0]);
+        if line.ends_with(b"\r\n") {
+            break;
+        }
+        if line.len() > 108 {
+            return Err("PROXY v1 header too long".into());
+        }
+    }
+    let text = String::from_utf8(line).map_err(|e| e.to_string())?;
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    if parts.len() != 6 {
+        return Err(format!("expected 6 PROXY v1 parts, got {parts:?}"));
+    }
+    if parts[0] != "PROXY" || parts[1] != "TCP4" {
+        return Err(format!("unexpected PROXY v1 prefix: {parts:?}"));
+    }
+    if parts[2] != "127.0.0.1" || parts[3] != "127.0.0.1" {
+        return Err(format!("unexpected PROXY v1 addresses: {parts:?}"));
+    }
+    let src_port: u16 = parts[4].parse::<u16>().map_err(|e| e.to_string())?;
+    let dst_port: u16 = parts[5].parse::<u16>().map_err(|e| e.to_string())?;
+    if src_port == 0 || dst_port != expected_public_port {
+        return Err(format!("unexpected PROXY v1 ports: {parts:?}"));
+    }
+    Ok(())
+}
+
+async fn verify_proxy_v2(
+    s: &mut TcpStream,
+    expected_public_port: u16,
+) -> std::result::Result<(), String> {
+    let mut header = [0u8; 16];
+    s.read_exact(&mut header).await.map_err(|e| e.to_string())?;
+    let sig = b"\r\n\r\n\0\r\nQUIT\n";
+    if &header[..12] != sig {
+        return Err(format!("bad PROXY v2 signature: {header:?}"));
+    }
+    if header[12] != 0x21 || header[13] != 0x11 {
+        return Err(format!("unexpected PROXY v2 command/family: {header:?}"));
+    }
+    let len = u16::from_be_bytes([header[14], header[15]]) as usize;
+    if len != 12 {
+        return Err(format!("unexpected PROXY v2 IPv4 length: {len}"));
+    }
+    let mut addr = vec![0u8; len];
+    s.read_exact(&mut addr).await.map_err(|e| e.to_string())?;
+    if addr[..4] != [127, 0, 0, 1] || addr[4..8] != [127, 0, 0, 1] {
+        return Err(format!("unexpected PROXY v2 addresses: {addr:?}"));
+    }
+    let src_port = u16::from_be_bytes([addr[8], addr[9]]);
+    let dst_port = u16::from_be_bytes([addr[10], addr[11]]);
+    if src_port == 0 || dst_port != expected_public_port {
+        return Err(format!(
+            "unexpected PROXY v2 ports: src={src_port} dst={dst_port}"
+        ));
+    }
+    Ok(())
 }
 
 async fn udp_echo() -> SocketAddr {
@@ -231,6 +348,7 @@ async fn tcp_tunnel_roundtrip() {
         local_addr: echo,
         remote_port: Some(public),
         enabled: true,
+        proxy_protocol: ProxyProtocol::Off,
     };
     start_relay(ingress, public, "tcp", tunnel);
 
@@ -251,6 +369,56 @@ async fn tcp_tunnel_roundtrip() {
 
 #[tokio::test]
 #[ignore = "uses real loopback sockets; run explicitly for relay smoke testing"]
+async fn tcp_tunnel_proxy_protocol_v1_forwards_source_metadata() {
+    install();
+    let (ingress, public) = (free_port(), free_port());
+    let (echo, report) = tcp_proxy_echo(ProxyProtocol::V1, public).await;
+    let tunnel = TunnelConfig {
+        name: "proxy-v1".into(),
+        protocol: Proto::Tcp,
+        local_addr: echo,
+        remote_port: Some(public),
+        enabled: true,
+        proxy_protocol: ProxyProtocol::V1,
+    };
+    start_relay(ingress, public, "proxy-v1", tunnel);
+
+    let public_addr: SocketAddr = format!("127.0.0.1:{public}").parse().unwrap();
+    let mut conn = connect_retry(public_addr).await;
+    conn.write_all(b"hello-v1").await.unwrap();
+    let mut buf = [0u8; 8];
+    conn.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"hello-v1");
+    assert_eq!(report.await.unwrap(), Ok(()));
+}
+
+#[tokio::test]
+#[ignore = "uses real loopback sockets; run explicitly for relay smoke testing"]
+async fn tcp_tunnel_proxy_protocol_v2_forwards_source_metadata() {
+    install();
+    let (ingress, public) = (free_port(), free_port());
+    let (echo, report) = tcp_proxy_echo(ProxyProtocol::V2, public).await;
+    let tunnel = TunnelConfig {
+        name: "proxy-v2".into(),
+        protocol: Proto::Tcp,
+        local_addr: echo,
+        remote_port: Some(public),
+        enabled: true,
+        proxy_protocol: ProxyProtocol::V2,
+    };
+    start_relay(ingress, public, "proxy-v2", tunnel);
+
+    let public_addr: SocketAddr = format!("127.0.0.1:{public}").parse().unwrap();
+    let mut conn = connect_retry(public_addr).await;
+    conn.write_all(b"hello-v2").await.unwrap();
+    let mut buf = [0u8; 8];
+    conn.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"hello-v2");
+    assert_eq!(report.await.unwrap(), Ok(()));
+}
+
+#[tokio::test]
+#[ignore = "uses real loopback sockets; run explicitly for relay smoke testing"]
 async fn paused_client_does_not_register_enabled_tunnels() {
     install();
     let echo = tcp_echo().await;
@@ -266,6 +434,7 @@ async fn paused_client_does_not_register_enabled_tunnels() {
         local_addr: echo,
         remote_port: Some(public),
         enabled: true,
+        proxy_protocol: ProxyProtocol::Off,
     };
     tokio::spawn(client::run(client_settings_with(
         ingress,
@@ -315,6 +484,7 @@ async fn web_pause_persists_drops_active_tcp_and_unpause_restores_enabled_only()
         local_addr: echo,
         remote_port: Some(enabled_port),
         enabled: true,
+        proxy_protocol: ProxyProtocol::Off,
     };
     let disabled = TunnelConfig {
         name: "disabled".into(),
@@ -322,6 +492,7 @@ async fn web_pause_persists_drops_active_tcp_and_unpause_restores_enabled_only()
         local_addr: echo,
         remote_port: Some(disabled_port),
         enabled: false,
+        proxy_protocol: ProxyProtocol::Off,
     };
     let config_path = temp_client_config("web-pause");
     tokio::spawn(client::run(client_settings_with(
@@ -375,6 +546,7 @@ async fn udp_tunnel_roundtrip() {
         local_addr: echo,
         remote_port: Some(public),
         enabled: true,
+        proxy_protocol: ProxyProtocol::Off,
     };
     start_relay(ingress, public, "udp", tunnel);
 
@@ -409,6 +581,7 @@ async fn udp_large_datagram_roundtrip() {
         local_addr: echo,
         remote_port: Some(public),
         enabled: true,
+        proxy_protocol: ProxyProtocol::Off,
     };
     start_relay(ingress, public, "udp-large", tunnel);
 
@@ -451,6 +624,7 @@ async fn client_reconnects_when_server_starts_late() {
         local_addr: echo,
         remote_port: Some(public),
         enabled: true,
+        proxy_protocol: ProxyProtocol::Off,
     };
     tokio::spawn(client::run(client_settings(ingress, fingerprint, tunnel)));
 

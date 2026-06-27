@@ -120,6 +120,10 @@ pub enum ServerMessage {
     NewConn {
         id: Uuid,
         tunnel: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        src_addr: Option<SocketAddr>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dst_addr: Option<SocketAddr>,
     },
     Heartbeat,
     Error {
@@ -382,6 +386,8 @@ mod tests {
         let sent = ServerMessage::NewConn {
             id: Uuid::nil(),
             tunnel: "mc".into(),
+            src_addr: Some("203.0.113.7:51820".parse().unwrap()),
+            dst_addr: Some("198.51.100.10:25565".parse().unwrap()),
         };
         send_msg(&mut wa, &sent).await.unwrap();
         let got: ServerMessage = recv_msg(&mut wb).await.unwrap();
