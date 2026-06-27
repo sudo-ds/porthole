@@ -2,7 +2,7 @@
 //! tunnels, dials data connections on demand, and exposes shared state to the web UI.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -180,8 +180,16 @@ pub async fn join(args: JoinArgs) -> Result<()> {
 
 /// Turn a connection code into client settings, preserving any existing tunnels.
 fn settings_from_code(code: &str, web_bind: Option<String>) -> Result<ClientSettings> {
+    settings_from_code_at(code, web_bind, config::default_client_config_path())
+}
+
+fn settings_from_code_at(
+    code: &str,
+    web_bind: Option<String>,
+    path: impl AsRef<Path>,
+) -> Result<ClientSettings> {
     let info = invite::decode(code)?;
-    let path = config::default_client_config_path();
+    let path = path.as_ref().to_path_buf();
     let mut file: ClientFile = if path.exists() {
         toml::from_str(&std::fs::read_to_string(&path).unwrap_or_default()).unwrap_or_default()
     } else {
@@ -648,5 +656,67 @@ fn host_of(addr: &str) -> &str {
     match addr.rfind(':') {
         Some(i) => &addr[..i],
         None => addr,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_client_path(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("porthole-client-unit-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("client.toml");
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn connection_code() -> String {
+        invite::encode(&invite::ConnectionInfo {
+            host: "relay.example.com".into(),
+            port: 7835,
+            fingerprint: "sha256:test-fingerprint".into(),
+            secret: "test-secret".into(),
+        })
+    }
+
+    #[test]
+    fn settings_from_code_decodes_invite_without_network() {
+        let path = temp_client_path("decode");
+        let settings = settings_from_code_at(&connection_code(), None, &path).unwrap();
+
+        assert_eq!(settings.server_addr, "relay.example.com:7835");
+        assert_eq!(settings.server_fingerprint, "sha256:test-fingerprint");
+        assert_eq!(settings.secret, "test-secret");
+        assert_eq!(settings.web_bind, crate::protocol::DEFAULT_WEB_BIND);
+        assert_eq!(settings.config_path, Some(path));
+        assert!(settings.file.tunnels.is_empty());
+    }
+
+    #[test]
+    fn settings_from_code_preserves_existing_tunnels_and_honors_web_override() {
+        let path = temp_client_path("preserve");
+        let tunnel = TunnelConfig {
+            name: "mc".into(),
+            protocol: Proto::Tcp,
+            local_addr: "127.0.0.1:25565".parse().unwrap(),
+            remote_port: Some(25565),
+            enabled: true,
+        };
+        let existing = ClientFile {
+            web_bind: Some("127.0.0.1:4041".into()),
+            tunnels: vec![tunnel.clone()],
+            ..Default::default()
+        };
+        std::fs::write(&path, toml::to_string(&existing).unwrap()).unwrap();
+
+        let settings =
+            settings_from_code_at(&connection_code(), Some("127.0.0.1:5050".into()), &path)
+                .unwrap();
+
+        assert_eq!(settings.web_bind, "127.0.0.1:5050");
+        assert_eq!(settings.file.web_bind.as_deref(), Some("127.0.0.1:5050"));
+        assert_eq!(settings.file.tunnels, vec![tunnel]);
     }
 }

@@ -10,7 +10,9 @@ use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, Layer};
 
-use crate::cli::{Cli, Command, ServiceCommand, ServiceKind};
+#[cfg(windows)]
+use crate::cli::ServiceKind;
+use crate::cli::{Cli, Command, ServiceCommand};
 use crate::config::{self, LogMode, LoggingConfig};
 use crate::tui;
 

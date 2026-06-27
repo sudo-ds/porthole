@@ -101,7 +101,7 @@ On an interactive terminal the client shows a live dashboard:
        .-"""""-.
      .'  o o o  '.        ... (purple logo) ...
        '-.....-'
-  client · v0.3.0
+  client · v0.3.1
 
   ● connected to 10xdev.sk:7835    public ports 1024-65535
 
