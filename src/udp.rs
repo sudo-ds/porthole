@@ -13,6 +13,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -42,6 +43,33 @@ pub async fn server_forward(
     socket: Arc<UdpSocket>,
     cancel: CancellationToken,
 ) -> Result<()> {
+    server_forward_io(wire, socket, cancel).await
+}
+
+trait UdpIo: Send + Sync + 'static {
+    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
+    async fn send_to(&self, data: &[u8], dst: SocketAddr) -> std::io::Result<usize>;
+}
+
+impl UdpIo for UdpSocket {
+    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        self.recv_from(buf).await
+    }
+
+    async fn send_to(&self, data: &[u8], dst: SocketAddr) -> std::io::Result<usize> {
+        self.send_to(data, dst).await
+    }
+}
+
+async fn server_forward_io<S, W>(
+    wire: Wire<W>,
+    socket: Arc<S>,
+    cancel: CancellationToken,
+) -> Result<()>
+where
+    S: UdpIo,
+    W: AsyncRead + AsyncWrite + Unpin,
+{
     let (mut sink, mut stream) = wire.split();
     // Couple the two halves: when either ends (the data conn closed, a socket error, or the
     // tunnel was cancelled), tear the other down too. Without this, the public-recv half would
@@ -318,4 +346,143 @@ async fn bind_local_flow(local: SocketAddr) -> std::io::Result<UdpSocket> {
 /// Milliseconds elapsed since `started`; the monotonic timestamp stored per flow.
 fn epoch_ms(started: &Instant) -> u64 {
     started.elapsed().as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tokio::sync::Mutex;
+    use tokio::time::{timeout, Duration};
+
+    struct MockUdp {
+        incoming: Mutex<mpsc::Receiver<(Vec<u8>, SocketAddr)>>,
+        outgoing: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+    }
+
+    struct MockUdpHarness {
+        socket: Arc<MockUdp>,
+        incoming_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+        outgoing_rx: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+    }
+
+    impl UdpIo for MockUdp {
+        async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            let mut incoming = self.incoming.lock().await;
+            let Some((data, src)) = incoming.recv().await else {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            };
+            let n = data.len().min(buf.len());
+            buf[..n].copy_from_slice(&data[..n]);
+            Ok((n, src))
+        }
+
+        async fn send_to(&self, data: &[u8], dst: SocketAddr) -> std::io::Result<usize> {
+            self.outgoing
+                .send((data.to_vec(), dst))
+                .await
+                .map_err(|_| std::io::ErrorKind::BrokenPipe)?;
+            Ok(data.len())
+        }
+    }
+
+    fn mock_udp() -> MockUdpHarness {
+        let (incoming_tx, incoming_rx) = mpsc::channel(8);
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(8);
+        MockUdpHarness {
+            socket: Arc::new(MockUdp {
+                incoming: Mutex::new(incoming_rx),
+                outgoing: outgoing_tx,
+            }),
+            incoming_tx,
+            outgoing_rx,
+        }
+    }
+
+    #[tokio::test]
+    async fn server_forward_bridges_mock_udp_and_wire() {
+        let MockUdpHarness {
+            socket,
+            incoming_tx,
+            mut outgoing_rx,
+        } = mock_udp();
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(server_forward_io(
+            crate::protocol::wire(server_io),
+            socket,
+            cancel.clone(),
+        ));
+        let mut client_wire = crate::protocol::wire(client_io);
+        let peer: SocketAddr = "198.51.100.10:40000".parse().unwrap();
+
+        incoming_tx.send((b"ping".to_vec(), peer)).await.unwrap();
+        let frame = timeout(
+            Duration::from_secs(1),
+            crate::protocol::recv_frame(&mut client_wire),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (got_peer, got_data) = decode_udp(&frame).unwrap();
+        assert_eq!(got_peer, peer);
+        assert_eq!(got_data, b"ping");
+
+        crate::protocol::send_frame(&mut client_wire, encode_udp(peer, b"pong"))
+            .await
+            .unwrap();
+        let (got_data, got_peer) = timeout(Duration::from_secs(1), outgoing_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got_peer, peer);
+        assert_eq!(got_data, b"pong");
+
+        cancel.cancel();
+        drop(incoming_tx);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_forward_preserves_large_mock_udp_datagram() {
+        let MockUdpHarness {
+            socket,
+            incoming_tx,
+            outgoing_rx: _outgoing_rx,
+        } = mock_udp();
+        let (server_io, client_io) = tokio::io::duplex(128 * 1024);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(server_forward_io(
+            crate::protocol::wire(server_io),
+            socket,
+            cancel.clone(),
+        ));
+        let mut client_wire = crate::protocol::wire(client_io);
+        let peer: SocketAddr = "203.0.113.77:49152".parse().unwrap();
+        let payload = vec![0xAB; 60_000];
+
+        incoming_tx.send((payload.clone(), peer)).await.unwrap();
+        let frame = timeout(
+            Duration::from_secs(1),
+            crate::protocol::recv_frame(&mut client_wire),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (got_peer, got_data) = decode_udp(&frame).unwrap();
+        assert_eq!(got_peer, peer);
+        assert_eq!(got_data, payload.as_slice());
+
+        cancel.cancel();
+        drop(incoming_tx);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 }

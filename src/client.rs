@@ -681,6 +681,35 @@ mod tests {
         })
     }
 
+    fn test_shared(
+        file: ClientFile,
+        config_path: Option<PathBuf>,
+        out: Option<mpsc::Sender<ClientMessage>>,
+    ) -> Arc<ClientShared> {
+        let _ = crate::install_crypto_provider();
+        let status = DashMap::new();
+        for tunnel in &file.tunnels {
+            status.insert(tunnel.name.clone(), status_from(tunnel));
+        }
+
+        Arc::new(ClientShared {
+            server_addr: "relay.example.com:7835".into(),
+            secret: "test-secret".into(),
+            connector: tls::client_connector(&format!("sha256:{}", "00".repeat(32))).unwrap(),
+            server_name: tls::pinned_server_name(),
+            config_path,
+            file: Mutex::new(file.clone()),
+            out: Mutex::new(out),
+            status,
+            tunnels_paused: AtomicBool::new(file.tunnels_paused),
+            connected: AtomicBool::new(false),
+            min_port: AtomicU16::new(0),
+            max_port: AtomicU16::new(0),
+            started: Instant::now(),
+            shutdown: CancellationToken::new(),
+        })
+    }
+
     #[test]
     fn settings_from_code_decodes_invite_without_network() {
         let path = temp_client_path("decode");
@@ -718,5 +747,72 @@ mod tests {
         assert_eq!(settings.web_bind, "127.0.0.1:5050");
         assert_eq!(settings.file.web_bind.as_deref(), Some("127.0.0.1:5050"));
         assert_eq!(settings.file.tunnels, vec![tunnel]);
+    }
+
+    #[tokio::test]
+    async fn pause_commands_persist_and_update_control_writer_without_network() {
+        let path = temp_client_path("pause");
+        let enabled = TunnelConfig {
+            name: "enabled".into(),
+            protocol: Proto::Tcp,
+            local_addr: "127.0.0.1:25565".parse().unwrap(),
+            remote_port: Some(25565),
+            enabled: true,
+        };
+        let disabled = TunnelConfig {
+            name: "disabled".into(),
+            protocol: Proto::Tcp,
+            local_addr: "127.0.0.1:25566".parse().unwrap(),
+            remote_port: Some(25566),
+            enabled: false,
+        };
+        let file = ClientFile {
+            tunnels: vec![enabled.clone(), disabled],
+            ..Default::default()
+        };
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let shared = test_shared(file, Some(path.clone()), Some(out_tx));
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let processor = tokio::spawn(command_processor(shared, cmd_rx));
+
+        cmd_tx.send(Command::SetPaused(true)).await.unwrap();
+        let msg = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            msg,
+            ClientMessage::Unregister {
+                name: "enabled".into()
+            }
+        );
+        assert!(out_rx.try_recv().is_err());
+        let persisted: ClientFile =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(persisted.tunnels_paused);
+
+        cmd_tx.send(Command::SetPaused(false)).await.unwrap();
+        let msg = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            msg,
+            ClientMessage::Register {
+                name: "enabled".into(),
+                proto: Proto::Tcp,
+                remote_port: Some(25565)
+            }
+        );
+        assert!(out_rx.try_recv().is_err());
+        let persisted: ClientFile =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(!persisted.tunnels_paused);
+
+        drop(cmd_tx);
+        tokio::time::timeout(Duration::from_secs(1), processor)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
