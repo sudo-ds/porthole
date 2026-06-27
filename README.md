@@ -155,9 +155,24 @@ The simplest deploy: `git clone` on the VPS and `cargo build --release` there.
 `scp` the binary to `/usr/local/bin/porthole`, then:
 
 ```sh
-cp porthole.service /etc/systemd/system/porthole.service   # hardened unit, DynamicUser
-systemctl enable --now porthole
-porthole server --show-invite --public-host your.domain     # get a code to share
+sudo install -d -m 755 /etc/porthole
+sudo install -m 644 config/server.example.toml /etc/porthole/server.toml
+printf 'PORTHOLE_SECRET=%s\n' "$(/usr/local/bin/porthole gen-token)" \
+  | sudo tee /etc/porthole/porthole.env >/dev/null
+sudo chmod 600 /etc/porthole/porthole.env
+sudoedit /etc/porthole/server.toml       # set public_host and adjust the port range
+
+sudo install -m 644 porthole.service /etc/systemd/system/porthole.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now porthole
+```
+
+The packaged unit runs `porthole server --config /etc/porthole/server.toml`, so that file must
+exist before the service starts. To print a client connection code from the same config, secret,
+and TLS certificate used by systemd:
+
+```sh
+sudo sh -c 'set -a; . /etc/porthole/porthole.env; set +a; cd /var/lib/porthole && /usr/local/bin/porthole server --config /etc/porthole/server.toml --show-invite'
 ```
 
 Open the ingress port and your public tunnel range in the firewall (e.g.
