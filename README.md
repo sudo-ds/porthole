@@ -47,6 +47,10 @@ You do not pass `--fingerprint` to `porthole join`. The `porthole1_...` connecti
 contains the server address, the pinned TLS certificate fingerprint, and the shared secret; `join`
 stores those in the client config for you.
 
+If the server secret or certificate changes, generate a fresh connection code on the server.
+Re-running `porthole join` with an old code will put the old secret/fingerprint back into the
+client config.
+
 That's it. The client connects, opens its dashboard, and you add tunnels (in the live web UI
 at `http://127.0.0.1:4040`, or in the config). To expose a Minecraft server, point a tunnel at
 `127.0.0.1:25565` and players connect to `your-server:25565`.
@@ -126,7 +130,9 @@ porthole gen-token
   For the packaged systemd service, use the command in the deployment section so the invite is
   generated with the same `/etc/porthole/server.toml`, `PORTHOLE_SECRET`, and TLS certificate.
 - `porthole join <CODE>` does not take `--fingerprint`; the code already includes the pinned
-  fingerprint and the client saves it as `server_fingerprint`.
+  fingerprint and shared secret, and the client saves them as `server_fingerprint` and `secret`.
+  If you need to override the secret manually, use `porthole client` with `PORTHOLE_SECRET`,
+  `--secret-file`, or a `secret = "..."` entry in the client config instead of `join`.
 - Config files (`porthole-server.toml`, `porthole-client.toml`) are created next to the binary
   and updated as you change tunnels. See `config/*.example.toml`.
 
