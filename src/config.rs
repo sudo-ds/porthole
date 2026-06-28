@@ -12,6 +12,7 @@ use crate::protocol::{
 };
 
 pub const ENV_SECRET: &str = "PORTHOLE_SECRET";
+pub const MAX_TUNNEL_PORTS: usize = 2048;
 
 // ---------------------------------------------------------------------------
 // Logging config (shared by server and client)
@@ -85,6 +86,9 @@ pub struct TunnelConfig {
     /// Requested public port on the server. `None`/`0` => server picks one.
     #[serde(default)]
     pub remote_port: Option<u16>,
+    /// Optional local port selection for multi-port tunnels, e.g. "4000-6000" or "1000,2000".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_ports: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
@@ -216,12 +220,139 @@ impl<'de> Deserialize<'de> for UdpSourcePool {
 }
 
 pub fn validate_tunnel_config(t: &TunnelConfig) -> Result<()> {
+    let ports = tunnel_port_selection(t)?;
+    if ports.first_port() != t.local_addr.port() {
+        bail!(
+            "local_ports must start with local_addr port {}",
+            t.local_addr.port()
+        );
+    }
     if t.protocol != Proto::Tcp && !t.proxy_protocol.is_off() {
         bail!("proxy_protocol is only supported for tcp-only tunnels");
     }
     validate_udp_mtu(t.protocol, t.udp_mtu)?;
     validate_udp_source_pool(t.protocol, t.local_addr, t.udp_source_pool)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortSelection {
+    Single(u16),
+    Range { start: u16, end: u16 },
+    List(Vec<u16>),
+}
+
+impl PortSelection {
+    pub fn ports(&self) -> Vec<u16> {
+        match self {
+            Self::Single(port) => vec![*port],
+            Self::Range { start, end } => (*start..=*end).collect(),
+            Self::List(ports) => ports.clone(),
+        }
+    }
+
+    pub fn first_port(&self) -> u16 {
+        match self {
+            Self::Single(port) => *port,
+            Self::Range { start, .. } => *start,
+            Self::List(ports) => ports[0],
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        match self {
+            Self::Single(_) => 1,
+            Self::Range { start, end } => usize::from(*end - *start) + 1,
+            Self::List(ports) => ports.len(),
+        }
+    }
+
+    pub fn is_range(&self) -> bool {
+        matches!(self, Self::Range { .. })
+    }
+
+    pub fn spec_string(&self) -> String {
+        match self {
+            Self::Single(port) => port.to_string(),
+            Self::Range { start, end } => format!("{start}-{end}"),
+            Self::List(ports) => ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        }
+    }
+}
+
+pub fn tunnel_port_selection(t: &TunnelConfig) -> Result<PortSelection> {
+    match t.local_ports.as_deref() {
+        Some(spec) => parse_local_ports(spec),
+        None => Ok(PortSelection::Single(t.local_addr.port())),
+    }
+}
+
+pub fn tunnel_local_ports_spec(t: &TunnelConfig) -> Result<String> {
+    Ok(tunnel_port_selection(t)?.spec_string())
+}
+
+pub fn parse_local_ports(spec: &str) -> Result<PortSelection> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        bail!("local_ports is empty");
+    }
+    let selection = if spec.contains(',') {
+        let mut ports = Vec::new();
+        for part in spec.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                bail!("empty local port in {spec:?}");
+            }
+            if part.contains('-') {
+                bail!("local_ports lists must contain individual ports, not ranges");
+            }
+            ports.push(parse_nonzero_port(part, "local port")?);
+        }
+        PortSelection::List(ports)
+    } else if let Some((start, end)) = spec.split_once('-') {
+        let start = parse_nonzero_port(start.trim(), "local port range start")?;
+        let end = parse_nonzero_port(end.trim(), "local port range end")?;
+        if end < start {
+            bail!("local_ports range end must be greater than or equal to start");
+        }
+        PortSelection::Range { start, end }
+    } else {
+        PortSelection::Single(parse_nonzero_port(spec, "local port")?)
+    };
+
+    validate_port_selection(&selection)?;
+    Ok(selection)
+}
+
+fn validate_port_selection(selection: &PortSelection) -> Result<()> {
+    let ports = selection.ports();
+    if ports.is_empty() {
+        bail!("local_ports must contain at least one port");
+    }
+    if ports.len() > MAX_TUNNEL_PORTS {
+        bail!("local_ports may contain at most {MAX_TUNNEL_PORTS} ports");
+    }
+    let mut seen = std::collections::HashSet::with_capacity(ports.len());
+    for port in ports {
+        if !seen.insert(port) {
+            bail!("local_ports contains duplicate port {port}");
+        }
+    }
+    Ok(())
+}
+
+fn parse_nonzero_port(value: &str, label: &str) -> Result<u16> {
+    let port: u16 = value
+        .parse()
+        .with_context(|| format!("invalid {label} {value:?}"))?;
+    if port == 0 {
+        bail!("{label} must be between 1 and 65535");
+    }
+    Ok(port)
 }
 
 pub fn validate_udp_mtu(proto: Proto, udp_mtu: Option<u16>) -> Result<()> {
@@ -323,9 +454,7 @@ pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelConfig> {
         }
     }
     let protocol: Proto = proto.parse()?;
-    let local_addr: SocketAddr = local
-        .trim()
-        .parse()
+    let (local_addr, local_ports) = parse_local_endpoint(local)
         .with_context(|| format!("invalid local address {local:?} in {spec:?}"))?;
     let remote_port: u16 = remote
         .trim()
@@ -336,6 +465,7 @@ pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelConfig> {
         protocol,
         local_addr,
         remote_port: (remote_port != 0).then_some(remote_port),
+        local_ports,
         enabled: true,
         encrypted,
         udp_mtu,
@@ -344,6 +474,25 @@ pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelConfig> {
     };
     validate_tunnel_config(&t)?;
     Ok(t)
+}
+
+pub fn parse_local_endpoint(local: &str) -> Result<(SocketAddr, Option<String>)> {
+    let local = local.trim();
+    if let Ok(addr) = local.parse::<SocketAddr>() {
+        return Ok((addr, None));
+    }
+
+    let Some(colon) = local.rfind(':') else {
+        bail!("expected HOST:PORT");
+    };
+    let host = &local[..colon];
+    let port_spec = &local[colon + 1..];
+    let selection = parse_local_ports(port_spec)?;
+    let base = format!("{host}:{}", selection.first_port());
+    let addr = base
+        .parse::<SocketAddr>()
+        .with_context(|| format!("invalid local endpoint {base:?}"))?;
+    Ok((addr, Some(selection.spec_string())))
 }
 
 fn parse_bool_option(value: &str) -> Result<bool> {
@@ -702,6 +851,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_spec_accepts_inclusive_local_port_range() {
+        let t = parse_tunnel_spec("r=tcp:127.0.0.1:4000-4002->0").unwrap();
+        assert_eq!(t.local_addr, "127.0.0.1:4000".parse().unwrap());
+        assert_eq!(t.local_ports.as_deref(), Some("4000-4002"));
+        assert_eq!(
+            tunnel_port_selection(&t).unwrap().ports(),
+            vec![4000, 4001, 4002]
+        );
+    }
+
+    #[test]
+    fn parse_spec_accepts_local_port_list() {
+        let t = parse_tunnel_spec("r=tcp:127.0.0.1:1000,2000->0").unwrap();
+        assert_eq!(t.local_addr, "127.0.0.1:1000".parse().unwrap());
+        assert_eq!(t.local_ports.as_deref(), Some("1000,2000"));
+        assert_eq!(tunnel_port_selection(&t).unwrap().ports(), vec![1000, 2000]);
+    }
+
+    #[test]
     fn parse_spec_rejects_garbage() {
         assert!(parse_tunnel_spec("nope").is_err());
         assert!(parse_tunnel_spec("a=tcp:badaddr->1").is_err());
@@ -718,6 +886,17 @@ mod tests {
         assert!(parse_tunnel_spec("a=udp:[::1]:1->2;udp_source_pool=127.64.0.0/16").is_err());
         assert!(parse_tunnel_spec("a=udp:192.0.2.10:1->2;udp_source_pool=127.64.0.0/16").is_err());
         assert!(parse_tunnel_spec("a=udp:127.0.0.1:1->2;udp_source_pool=::1/128").is_err());
+        assert!(parse_tunnel_spec("a=tcp:127.0.0.1:2,2->0").is_err());
+        assert!(parse_tunnel_spec("a=tcp:127.0.0.1:2-1->0").is_err());
+        assert!(parse_tunnel_spec("a=tcp:127.0.0.1:1,2-3->0").is_err());
+        assert!(parse_tunnel_spec("a=tcp:127.0.0.1:1-2049->0").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_local_ports_that_do_not_start_at_local_addr_port() {
+        let mut t = parse_tunnel_spec("a=tcp:127.0.0.1:1000,2000->0").unwrap();
+        t.local_addr = "127.0.0.1:2000".parse().unwrap();
+        assert!(validate_tunnel_config(&t).is_err());
     }
 
     #[test]

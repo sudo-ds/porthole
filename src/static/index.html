@@ -7,34 +7,34 @@
 <style>
   :root {
     color-scheme: dark;
-    --bg:#0b0e0b;
-    --bg-soft:#101510;
-    --surface:#151a15;
-    --surface-2:#1a211b;
-    --field:#0d110d;
+    --bg:#090d0a;
+    --bg-soft:#0f1510;
+    --surface:#141a15;
+    --surface-2:#1a221c;
+    --field:#0c110d;
     --line:#2b352d;
-    --line-strong:#3d4a40;
+    --line-strong:#3d4b40;
     --fg:#eef3eb;
-    --muted:#9aa794;
-    --muted-2:#738070;
-    --up:#63d471;
+    --muted:#9ba894;
+    --muted-2:#72806f;
+    --up:#68d978;
     --down:#f27979;
     --accent:#9ccf9f;
-    --accent-strong:#c5e8c4;
+    --accent-strong:#c8ecc7;
     --link:#9dbdf8;
     --warn:#e8b464;
     --tcp:#85b9ff;
     --udp:#c9a7ff;
     --both:#9edda9;
   }
-  * { box-sizing: border-box; }
+  * { box-sizing:border-box; }
   html { min-height:100%; background:var(--bg); }
   body {
     margin:0;
     min-height:100%;
     background:
-      linear-gradient(180deg, rgba(156,207,159,0.05), transparent 260px),
-      linear-gradient(180deg, var(--bg-soft), var(--bg) 48%);
+      linear-gradient(180deg, rgba(156,207,159,0.06), transparent 280px),
+      linear-gradient(180deg, var(--bg-soft), var(--bg) 54%);
     color:var(--fg);
     font:14px/1.5 "Aptos", "IBM Plex Sans", "Segoe UI", sans-serif;
   }
@@ -46,27 +46,30 @@
     min-height:72px;
     padding:18px clamp(18px, 4vw, 44px);
     border-bottom:1px solid var(--line);
-    background:rgba(11,14,11,0.88);
+    background:rgba(9,13,10,0.9);
     backdrop-filter:blur(12px);
+    position:sticky;
+    top:0;
+    z-index:3;
   }
   .brand { display:flex; align-items:center; gap:12px; min-width:0; }
-  header h1 { font-size:20px; line-height:1; margin:0; letter-spacing:0.04em; }
+  header h1 { margin:0; font-size:20px; line-height:1; letter-spacing:0.04em; }
   .dot { width:9px; height:9px; border-radius:50%; display:inline-block; flex:0 0 auto; }
-  .up { background:var(--up); box-shadow:0 0 0 4px rgba(99,212,113,0.12); }
+  .up { background:var(--up); box-shadow:0 0 0 4px rgba(104,217,120,0.12); }
   .down { background:var(--down); box-shadow:0 0 0 4px rgba(242,121,121,0.12); }
   .meta {
     display:flex;
     gap:18px;
     margin-left:auto;
     color:var(--muted);
-    font:12px/1.4 "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+    font:12px/1.4 "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
     text-align:right;
   }
   .meta span { color:var(--fg); }
   main {
-    width:min(1520px, calc(100% - 24px));
+    width:min(1540px, calc(100% - 24px));
     margin:0 auto;
-    padding:36px 0 56px;
+    padding:28px 0 56px;
   }
   h2 {
     margin:0;
@@ -76,6 +79,47 @@
     letter-spacing:0.08em;
     text-transform:uppercase;
   }
+  .overview {
+    display:grid;
+    grid-template-columns:repeat(4, minmax(0, 1fr));
+    gap:12px;
+    margin-bottom:18px;
+  }
+  .stat {
+    border-top:1px solid var(--line);
+    border-bottom:1px solid var(--line);
+    padding:14px 0;
+  }
+  .stat span {
+    display:block;
+    color:var(--muted);
+    font:11px/1.2 "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
+    text-transform:uppercase;
+    letter-spacing:0.07em;
+  }
+  .stat strong {
+    display:block;
+    margin-top:7px;
+    font:700 24px/1.1 "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
+  }
+  .charts {
+    display:grid;
+    grid-template-columns:2fr 1fr;
+    gap:16px;
+    margin-bottom:30px;
+  }
+  .chart {
+    min-width:0;
+    border:1px solid var(--line);
+    border-radius:8px;
+    background:linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.015)), var(--surface);
+    padding:14px;
+  }
+  .chart-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:10px; }
+  .chart-head .legend { display:flex; gap:10px; color:var(--muted); font:12px/1.2 "Cascadia Mono", "JetBrains Mono", Consolas, monospace; }
+  .key { display:inline-flex; align-items:center; gap:5px; }
+  .key::before { content:""; width:8px; height:8px; border-radius:50%; background:currentColor; }
+  canvas { display:block; width:100%; height:170px; }
   .toolbar {
     display:flex;
     justify-content:space-between;
@@ -91,19 +135,20 @@
   }
   table {
     width:100%;
-    min-width:1280px;
+    min-width:1380px;
     table-layout:fixed;
     border-collapse:separate;
     border-spacing:0;
   }
   col.name-col { width:10%; }
-  col.proto-col { width:25%; }
+  col.proto-col { width:21%; }
   col.local-col { width:14%; }
-  col.public-col { width:14%; }
-  col.metric-col { width:5.5%; }
+  col.public-col { width:18%; }
+  col.metric-col { width:6%; }
+  col.rate-col { width:6%; }
   col.conns-col { width:5%; }
   col.diag-col { width:7%; }
-  col.actions-col { width:14%; }
+  col.actions-col { width:17%; }
   th, td { text-align:left; }
   th {
     padding:14px 14px 12px;
@@ -115,7 +160,7 @@
     white-space:nowrap;
   }
   td {
-    padding:18px 14px;
+    padding:17px 14px;
     border-top:1px solid var(--line);
     vertical-align:middle;
   }
@@ -123,34 +168,31 @@
   tbody tr:hover { background:rgba(156,207,159,0.035); }
   .name-cell { display:flex; align-items:center; gap:12px; min-width:0; white-space:nowrap; }
   .name-cell strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:15px; font-weight:700; }
-  .proto-cell { display:flex; align-items:center; gap:7px; flex-wrap:nowrap; min-width:0; }
+  .proto-cell, .public-endpoint { display:flex; align-items:center; gap:7px; flex-wrap:wrap; min-width:0; }
   .endpoint {
-    font:13px/1.45 "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+    font:13px/1.45 "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
     color:var(--fg);
     white-space:nowrap;
   }
-  td.public { min-width:220px; }
   td.public a { color:var(--link); text-decoration:none; }
   td.public a:hover { text-decoration:underline; text-underline-offset:3px; }
-  td.public .public-endpoint { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
   .metric {
     min-width:72px;
     text-align:right;
-    font:13px/1.45 "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+    font:13px/1.45 "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
     font-variant-numeric:tabular-nums;
     white-space:nowrap;
   }
   .diag {
-    min-width:140px;
-    font:12px/1.35 "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+    min-width:130px;
+    font:12px/1.35 "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
     font-variant-numeric:tabular-nums;
     white-space:nowrap;
   }
   .diag-cell { display:flex; flex-direction:column; gap:2px; }
   .diag-sub { color:var(--muted); font-size:11px; }
-  .muted-mono { color:var(--muted-2); font:13px/1.45 "JetBrains Mono", "Cascadia Mono", Consolas, monospace; }
-  td.actions { width:176px; }
-  .action-buttons { display:grid; grid-template-columns:80px 80px; gap:8px; align-items:center; }
+  .muted-mono { color:var(--muted-2); font:13px/1.45 "Cascadia Mono", "JetBrains Mono", Consolas, monospace; }
+  .action-buttons { display:grid; grid-template-columns:64px 70px 72px; gap:8px; align-items:center; }
   .action-buttons button { width:100%; text-align:center; }
   .pill {
     display:inline-flex;
@@ -161,11 +203,11 @@
     border:1px solid var(--line-strong);
     color:var(--muted);
     background:rgba(255,255,255,0.02);
-    font:11px/1.2 "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+    font:11px/1.2 "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
     white-space:nowrap;
   }
   .paused { color:var(--warn); border-color:rgba(232,180,100,0.55); }
-  .err { color:var(--down); font-size:12px; }
+  .err { color:var(--down); font-size:12px; overflow-wrap:anywhere; }
   .hint { color:var(--muted-2); font-weight:500; }
   .tcp { color:var(--tcp); } .udp { color:var(--udp); } .both { color:var(--both); }
   .proxy-badge { color:var(--warn); border-color:rgba(232,180,100,0.48); }
@@ -202,12 +244,13 @@
   }
   button.primary:hover { background:var(--accent-strong); border-color:var(--accent-strong); }
   .add-section { margin-top:32px; }
-  form {
+  form.grid {
     display:grid;
-    grid-template-columns:minmax(160px,1.2fr) minmax(92px,0.6fr) minmax(120px,0.8fr) minmax(104px,0.65fr) minmax(240px,1.8fr) minmax(160px,1fr) minmax(112px,0.75fr) minmax(96px,0.5fr);
+    grid-template-columns:minmax(150px,1.1fr) minmax(92px,0.6fr) minmax(112px,0.7fr) minmax(104px,0.65fr) minmax(260px,1.9fr) minmax(150px,0.9fr) minmax(112px,0.75fr) minmax(96px,0.5fr);
     grid-template-areas:
       "name proto encryption mtu local remote proxy submit"
-      "sourcepool sourcepool sourcepool sourcepool sourcepool sourcepool sourcepool sourcepool";
+      "sourcepool sourcepool sourcepool sourcepool sourcepool sourcepool sourcepool sourcepool"
+      "error error error error error error error error";
     gap:14px 12px;
     align-items:end;
     margin-top:12px;
@@ -241,12 +284,13 @@
     border:1px solid var(--line-strong);
     border-radius:8px;
     padding:7px 10px;
-    font:13px/1.2 "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+    font:13px/1.2 "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
   }
   input:focus, select:focus, button:focus-visible {
     outline:2px solid rgba(156,207,159,0.38);
     outline-offset:2px;
   }
+  input[readonly] { color:var(--muted); }
   .field-name { grid-area:name; }
   .field-proto { grid-area:proto; }
   .field-encryption { grid-area:encryption; }
@@ -256,9 +300,24 @@
   .field-remote { grid-area:remote; }
   .field-proxy { grid-area:proxy; }
   .field-submit { grid-area:submit; }
+  .form-error { grid-area:error; min-height:18px; color:var(--down); font-size:12px; }
   .empty { color:var(--muted); padding:18px 0; }
-  @media (max-width: 980px) {
-    main { width:min(100% - 24px, 760px); padding-top:24px; }
+  dialog {
+    width:min(940px, calc(100vw - 28px));
+    border:1px solid var(--line-strong);
+    border-radius:8px;
+    background:var(--surface);
+    color:var(--fg);
+    padding:0;
+  }
+  dialog::backdrop { background:rgba(0,0,0,0.62); backdrop-filter:blur(4px); }
+  .dialog-head { display:flex; align-items:center; justify-content:space-between; gap:14px; padding:18px; border-bottom:1px solid var(--line); }
+  .dialog-head h2 { color:var(--fg); }
+  .dialog-body { padding:0 18px 18px; }
+  @media (max-width: 1080px) {
+    .overview { grid-template-columns:repeat(2, minmax(0, 1fr)); }
+    .charts { grid-template-columns:1fr; }
+    main { width:min(100% - 24px, 820px); padding-top:24px; }
     header { align-items:flex-start; flex-wrap:wrap; }
     .meta { width:100%; margin-left:21px; justify-content:flex-start; text-align:left; }
     .table-wrap { overflow:visible; border:0; }
@@ -289,24 +348,25 @@
       text-transform:uppercase;
     }
     .metric { width:100%; text-align:left; }
-    .action-buttons { grid-template-columns:1fr 1fr; }
-    form {
+    .action-buttons { grid-template-columns:1fr 1fr 1fr; }
+    form.grid {
       grid-template-columns:repeat(2, minmax(0, 1fr));
       grid-template-areas:none;
     }
-    form label, form button[type="submit"] { grid-area:auto; }
-    form button[type="submit"] { grid-column:1 / -1; }
+    form.grid label, form.grid button[type="submit"], .form-error { grid-area:auto; }
+    form.grid button[type="submit"], .form-error { grid-column:1 / -1; }
   }
   @media (max-width: 560px) {
     body { font-size:13px; }
     main { width:min(100% - 20px, 480px); }
+    .overview { grid-template-columns:1fr; }
     .toolbar { align-items:flex-start; flex-direction:column; }
     #pauseBtn { width:100%; }
     td { grid-template-columns:1fr; gap:5px; }
     .endpoint { white-space:normal; overflow-wrap:anywhere; }
-    .proto-cell { flex-wrap:wrap; }
     .name-cell strong { white-space:normal; overflow-wrap:anywhere; }
-    form { grid-template-columns:1fr; padding:14px; }
+    form.grid { grid-template-columns:1fr; padding:14px; }
+    .action-buttons { grid-template-columns:1fr; }
   }
 </style>
 </head>
@@ -317,11 +377,35 @@
     <h1>porthole</h1>
   </div>
   <div class="meta">
-    <div>server: <span id="server">—</span></div>
-    <div>uptime: <span id="uptime">—</span></div>
+    <div>server: <span id="server">--</span></div>
+    <div>uptime: <span id="uptime">--</span></div>
   </div>
 </header>
 <main>
+  <section class="overview" aria-label="Overview">
+    <div class="stat"><span>In</span><strong id="inRate">--</strong></div>
+    <div class="stat"><span>Out</span><strong id="outRate">--</strong></div>
+    <div class="stat"><span>Active</span><strong id="activeNow">--</strong></div>
+    <div class="stat"><span>Latency</span><strong id="latencyNow">--</strong></div>
+  </section>
+
+  <section class="charts" aria-label="Metrics">
+    <div class="chart">
+      <div class="chart-head">
+        <h2>Bandwidth</h2>
+        <div class="legend"><span class="key tcp">in</span><span class="key both">out</span></div>
+      </div>
+      <canvas id="bandwidthChart" width="900" height="240"></canvas>
+    </div>
+    <div class="chart">
+      <div class="chart-head">
+        <h2>Latency</h2>
+        <div class="legend"><span class="key udp">ms</span></div>
+      </div>
+      <canvas id="latencyChart" width="420" height="240"></canvas>
+    </div>
+  </section>
+
   <div class="toolbar">
     <div class="state">
       <h2>Tunnels</h2>
@@ -332,46 +416,65 @@
   <div class="table-wrap">
     <table aria-label="Tunnels">
       <colgroup>
-        <col class="name-col">
-        <col class="proto-col">
-        <col class="local-col">
-        <col class="public-col">
-        <col class="metric-col">
-        <col class="metric-col">
-        <col class="conns-col">
-        <col class="diag-col">
-        <col class="actions-col">
+        <col class="name-col"><col class="proto-col"><col class="local-col"><col class="public-col">
+        <col class="metric-col"><col class="metric-col"><col class="rate-col"><col class="conns-col"><col class="diag-col"><col class="actions-col">
       </colgroup>
       <thead><tr>
         <th>Name</th><th>Proto</th><th>Local</th><th>Public</th>
-        <th>In</th><th>Out</th><th>Conns</th><th>Diag</th><th></th>
+        <th>In</th><th>Out</th><th>Rate</th><th>Conns</th><th>Diag</th><th></th>
       </tr></thead>
       <tbody id="rows"></tbody>
     </table>
   </div>
-  <div id="empty" class="empty" hidden>No tunnels yet — add one below.</div>
+  <div id="empty" class="empty" hidden>No tunnels yet.</div>
 
   <section class="add-section" aria-labelledby="add-title">
     <h2 id="add-title">Add tunnel</h2>
-    <form id="add">
+    <form id="add" class="grid">
       <label class="field-name">Name<input name="name" placeholder="minecraft" required></label>
-      <label class="field-proto">Proto<select id="protoSelect" name="proto"><option>tcp</option><option>udp</option><option>both</option></select></label>
+      <label class="field-proto">Proto<select name="proto" data-proto><option>tcp</option><option>udp</option><option>both</option></select></label>
       <label class="field-encryption">Encryption<select name="encrypted"><option value="false">Plain</option><option value="true">TLS</option></select></label>
-      <label id="mtuLabel" class="field-mtu">UDP MTU<input name="udp_mtu" type="number" min="256" max="65507" placeholder="1200"></label>
-      <label id="poolLabel" class="field-source-pool">UDP source pool<input name="udp_source_pool" placeholder="127.64.0.0/16"></label>
-      <label class="field-local">Local address<input name="local" placeholder="25565 or 127.0.0.1:25565" required></label>
-      <label class="field-remote"><span class="label-row">Public port <small id="range" class="hint"></small></span><input name="remote_port" type="number" min="0" max="65535" placeholder="25565"></label>
-      <label id="proxyLabel" class="field-proxy">Proxy<select name="proxy_protocol"><option value="off">Off</option><option value="v1">PROXY v1</option><option value="v2">PROXY v2</option></select></label>
+      <label class="field-mtu" data-mtu>UDP MTU<input name="udp_mtu" type="number" min="256" max="65507" placeholder="1200"></label>
+      <label class="field-source-pool" data-pool>UDP source pool<input name="udp_source_pool" placeholder="127.64.0.0/16"></label>
+      <label class="field-local">Local address<input name="local" placeholder="25565 or 127.0.0.1:4000-6000" required></label>
+      <label class="field-remote"><span class="label-row">Public start <small id="range" class="hint"></small></span><input name="remote_port" type="number" min="0" max="65535" placeholder="auto"></label>
+      <label class="field-proxy" data-proxy>Proxy<select name="proxy_protocol"><option value="off">Off</option><option value="v1">PROXY v1</option><option value="v2">PROXY v2</option></select></label>
       <button class="primary field-submit" type="submit">Add</button>
+      <div id="addError" class="form-error" role="status"></div>
     </form>
   </section>
 </main>
+
+<dialog id="editor">
+  <div class="dialog-head">
+    <h2>Edit tunnel</h2>
+    <button id="closeEditor" type="button">Close</button>
+  </div>
+  <div class="dialog-body">
+    <form id="edit" class="grid">
+      <label class="field-name">Name<input name="name" readonly required></label>
+      <label class="field-proto">Proto<select name="proto" data-proto><option>tcp</option><option>udp</option><option>both</option></select></label>
+      <label class="field-encryption">Encryption<select name="encrypted"><option value="false">Plain</option><option value="true">TLS</option></select></label>
+      <label class="field-mtu" data-mtu>UDP MTU<input name="udp_mtu" type="number" min="256" max="65507" placeholder="1200"></label>
+      <label class="field-source-pool" data-pool>UDP source pool<input name="udp_source_pool" placeholder="127.64.0.0/16"></label>
+      <label class="field-local">Local address<input name="local" required></label>
+      <label class="field-remote"><span class="label-row">Public start <small class="hint" data-edit-range></small></span><input name="remote_port" type="number" min="0" max="65535" placeholder="auto"></label>
+      <label class="field-proxy" data-proxy>Proxy<select name="proxy_protocol"><option value="off">Off</option><option value="v1">PROXY v1</option><option value="v2">PROXY v2</option></select></label>
+      <button class="primary field-submit" type="submit">Save</button>
+      <div id="editError" class="form-error" role="status"></div>
+    </form>
+  </div>
+</dialog>
+
 <script>
+let lastStatus = null;
+
 const fmtBytes = n => {
-  const u = ['B','KB','MB','GB','TB']; let i = 0;
+  const u = ['B','KB','MB','GB','TB']; let i = 0; n = Number(n || 0);
   while (n >= 1024 && i < u.length-1) { n /= 1024; i++; }
-  return (i ? n.toFixed(1) : n) + ' ' + u[i];
+  return (i ? n.toFixed(1) : Math.round(n)) + ' ' + u[i];
 };
+const fmtBps = n => `${fmtBytes((Number(n || 0) / 8))}/s`;
 const fmtDur = s => {
   const d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
   if (d) return `${d}d ${h}h`; if (h) return `${h}h ${m}m`; if (m) return `${m}m`; return `${s}s`;
@@ -383,15 +486,19 @@ const fmtMs = n => {
   if (n < 100) return `${n.toFixed(1)} ms`;
   return `${Math.round(n)} ms`;
 };
-const escapeHtml = value => String(value).replace(/[&<>"']/g, ch => ({
+const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
   '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
 }[ch]));
-function diagSummary(d) {
-  if (!d || d.rtt_ms === null || d.rtt_ms === undefined) return '<span class="muted-mono">--</span>';
-  const excess = d.excess_ms === null || d.excess_ms === undefined ? '' : `<span class="diag-sub">+${fmtMs(d.excess_ms)} excess</span>`;
-  const relay = d.relay_overhead_ms === null || d.relay_overhead_ms === undefined ? '' : `<span class="diag-sub">sw ${fmtMs(d.relay_overhead_ms)}</span>`;
-  return `<span class="diag-cell"><span>${fmtMs(d.rtt_ms)}</span>${excess}${relay}</span>`;
+
+function diagSummary(t) {
+  const d = t.diagnostics;
+  const latency = t.latency_ms;
+  if (latency === null || latency === undefined) return '<span class="muted-mono">--</span>';
+  const excess = d && d.excess_ms !== null && d.excess_ms !== undefined ? `<span class="diag-sub">+${fmtMs(d.excess_ms)} excess</span>` : '';
+  const relay = d && d.relay_overhead_ms !== null && d.relay_overhead_ms !== undefined ? `<span class="diag-sub">sw ${fmtMs(d.relay_overhead_ms)}</span>` : '';
+  return `<span class="diag-cell"><span>${fmtMs(latency)}</span>${excess}${relay}</span>`;
 }
+
 async function copyText(text) {
   if (navigator.clipboard && window.isSecureContext) {
     await navigator.clipboard.writeText(text);
@@ -407,20 +514,91 @@ async function copyText(text) {
   document.execCommand('copy');
   area.remove();
 }
-async function refresh() {
-  let st;
-  try { st = await (await fetch('/api/status')).json(); }
-  catch { document.getElementById('conn').className = 'dot down'; return; }
-  document.getElementById('conn').className = 'dot ' + (st.connected ? 'up' : 'down');
-  document.getElementById('server').textContent = st.server;
-  document.getElementById('uptime').textContent = fmtDur(st.uptime_secs);
-  document.getElementById('range').textContent = st.max_port ? `(allowed ${st.min_port}-${st.max_port})` : '';
-  const pauseState = document.getElementById('pauseState');
-  pauseState.textContent = st.paused ? 'paused' : 'running';
-  pauseState.className = 'pill' + (st.paused ? ' paused' : '');
-  const pauseBtn = document.getElementById('pauseBtn');
-  pauseBtn.textContent = st.paused ? 'Unpause all' : 'Pause all';
-  pauseBtn.dataset.paused = st.paused ? '1' : '0';
+
+function updateOverview(st) {
+  const metrics = st.metrics || {};
+  document.getElementById('inRate').textContent = fmtBps(metrics.in_bps);
+  document.getElementById('outRate').textContent = fmtBps(metrics.out_bps);
+  document.getElementById('activeNow').textContent = metrics.active ?? 0;
+  document.getElementById('latencyNow').textContent = fmtMs(metrics.latency_ms);
+  drawBandwidth(metrics.history || []);
+  drawLatency(metrics.history || []);
+}
+
+function drawBandwidth(history) {
+  drawChart(document.getElementById('bandwidthChart'), history, [
+    { key:'in_bps', color:'#85b9ff' },
+    { key:'out_bps', color:'#9edda9' },
+  ], v => fmtBps(v));
+}
+
+function drawLatency(history) {
+  drawChart(document.getElementById('latencyChart'), history, [
+    { key:'latency_ms', color:'#c9a7ff' },
+  ], v => fmtMs(v));
+}
+
+function drawChart(canvas, history, series, formatValue) {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.floor(rect.width * dpr));
+  const h = Math.max(1, Math.floor(rect.height * dpr));
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = '#0c110d';
+  ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = 'rgba(156,207,159,0.12)';
+  ctx.lineWidth = 1 * dpr;
+  for (let i = 1; i < 4; i++) {
+    const y = Math.round(h * i / 4);
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+  const values = history.flatMap(p => series.map(s => Number(p[s.key] || 0)).filter(Number.isFinite));
+  const max = Math.max(1, ...values);
+  ctx.fillStyle = '#72806f';
+  ctx.font = `${11 * dpr}px Cascadia Mono, Consolas, monospace`;
+  ctx.fillText(formatValue(max), 8 * dpr, 16 * dpr);
+  if (history.length < 2) return;
+  series.forEach(s => {
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = 2 * dpr;
+    ctx.beginPath();
+    history.forEach((p, i) => {
+      const x = history.length === 1 ? 0 : (i / (history.length - 1)) * (w - 1);
+      const y = h - (Number(p[s.key] || 0) / max) * (h - 18 * dpr) - 4 * dpr;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  });
+}
+
+function formatLocalInput(t) {
+  if (!t.local_ports) return t.local;
+  const i = t.local.lastIndexOf(':');
+  if (i < 0) return t.local;
+  return `${t.local.slice(0, i + 1)}${t.local_ports}`;
+}
+
+function publicCell(st, t) {
+  if (st.paused && t.enabled) return '<span class="pill paused">paused</span>';
+  if (!t.enabled) return '<span class="pill">disabled</span>';
+  if (t.error) return `<span class="err" title="${escapeHtml(t.error)}">${escapeHtml(t.error)}</span>`;
+  const bindings = t.bindings || [];
+  if (bindings.length) {
+    const first = escapeHtml(bindings[0].public);
+    const title = escapeHtml(bindings.map(b => `${b.local_port}->${b.public}`).join('\n'));
+    const count = bindings.length > 1 ? `<span class="pill" title="${title}">${bindings.length} ports</span>` : '';
+    return `<span class="public-endpoint"><a class="endpoint" href="//${first}">${first}</a><button type="button" class="copy-btn" data-copy="${first}">copy</button>${count}</span>`;
+  }
+  if (t.public) {
+    const publicText = escapeHtml(t.public);
+    return `<span class="public-endpoint"><a class="endpoint" href="//${publicText}">${publicText}</a><button type="button" class="copy-btn" data-copy="${publicText}">copy</button></span>`;
+  }
+  return '<span class="pill">pending</span>';
+}
+
+function renderRows(st) {
   const rows = document.getElementById('rows');
   rows.innerHTML = '';
   document.getElementById('empty').hidden = st.tunnels.length > 0;
@@ -430,59 +608,120 @@ async function refresh() {
     const state = st.paused && t.enabled ? 'paused' : t.enabled ? (live ? 'live' : 'down') : 'disabled';
     const dot = `<span class="dot ${live ? 'up':'down'}" title="${state}"></span>`;
     const name = escapeHtml(t.name);
-    const local = escapeHtml(t.local);
     const proto = ['tcp', 'udp', 'both'].includes(t.proto) ? t.proto : '';
-    const protoText = escapeHtml(t.proto);
-    const publicText = t.public ? escapeHtml(t.public) : '';
-    const pub = st.paused && t.enabled ? '<span class="pill paused">paused</span>'
-              : !t.enabled ? '<span class="pill">disabled</span>'
-              : t.error ? `<span class="err" title="${escapeHtml(t.error)}">${escapeHtml(t.error)}</span>`
-              : t.public ? `<span class="public-endpoint"><a class="endpoint" href="//${publicText}">${publicText}</a><button type="button" class="copy-btn" data-copy="${publicText}" title="Copy public address">copy</button></span>`
-              : '<span class="pill">pending</span>';
     const hasUdp = t.proto === 'udp' || t.proto === 'both';
-    const proxyBadge = t.proto === 'tcp' && t.proxy_protocol && t.proxy_protocol !== 'off'
-      ? `<span class="pill proxy-badge">PROXY ${escapeHtml(t.proxy_protocol)}</span>`
-      : '';
-    const encryptionBadge = t.encrypted
-      ? '<span class="pill encrypt-badge">tls</span>'
-      : '<span class="pill plain-badge">plain</span>';
-    const mtuBadge = hasUdp && t.udp_mtu
-      ? `<span class="pill mtu-badge">mtu ${escapeHtml(t.udp_mtu)}</span>`
-      : '';
-    const sourcePoolBadge = hasUdp && t.udp_source_pool
-      ? `<span class="pill source-badge">pool ${escapeHtml(t.udp_source_pool)}</span>`
-      : '';
+    const proxyBadge = t.proto === 'tcp' && t.proxy_protocol && t.proxy_protocol !== 'off' ? `<span class="pill proxy-badge">PROXY ${escapeHtml(t.proxy_protocol)}</span>` : '';
+    const encryptionBadge = t.encrypted ? '<span class="pill encrypt-badge">tls</span>' : '<span class="pill plain-badge">plain</span>';
+    const mtuBadge = hasUdp && t.udp_mtu ? `<span class="pill mtu-badge">mtu ${escapeHtml(t.udp_mtu)}</span>` : '';
+    const sourcePoolBadge = hasUdp && t.udp_source_pool ? `<span class="pill source-badge">pool ${escapeHtml(t.udp_source_pool)}</span>` : '';
+    const portBadge = t.bindings && t.bindings.length > 1 ? `<span class="pill">${t.bindings.length} ports</span>` : '';
     const en = t.enabled ? 'disable' : 'enable';
     tr.innerHTML =
       `<td data-label="Name"><span class="name-cell">${dot}<strong>${name}</strong></span></td>` +
-      `<td data-label="Proto" class="${proto}"><span class="proto-cell">${protoText}${encryptionBadge}${mtuBadge}${sourcePoolBadge}${proxyBadge}</span></td>` +
-      `<td data-label="Local"><span class="endpoint">${local}</span></td>` +
-      `<td data-label="Public" class="public">${pub}</td>` +
+      `<td data-label="Proto" class="${proto}"><span class="proto-cell">${escapeHtml(t.proto)}${encryptionBadge}${portBadge}${mtuBadge}${sourcePoolBadge}${proxyBadge}</span></td>` +
+      `<td data-label="Local"><span class="endpoint">${escapeHtml(formatLocalInput(t))}</span></td>` +
+      `<td data-label="Public" class="public">${publicCell(st, t)}</td>` +
       `<td data-label="In" class="metric">${fmtBytes(t.bytes_in)}</td>` +
       `<td data-label="Out" class="metric">${fmtBytes(t.bytes_out)}</td>` +
+      `<td data-label="Rate" class="metric">${fmtBps(t.rate_in_bps)} / ${fmtBps(t.rate_out_bps)}</td>` +
       `<td data-label="Conns" class="metric">${escapeHtml(t.active)}</td>` +
-      `<td data-label="Diag" class="diag">${diagSummary(t.diagnostics)}</td>` +
-      `<td data-label="Actions" class="actions"><span class="action-buttons"><button data-toggle="${name}">${en}</button>` +
-      `<button class="danger" data-remove="${name}">remove</button></span></td>`;
+      `<td data-label="Diag" class="diag">${diagSummary(t)}</td>` +
+      `<td data-label="Actions" class="actions"><span class="action-buttons"><button data-edit="${name}">edit</button><button data-toggle="${name}">${en}</button><button class="danger" data-remove="${name}">remove</button></span></td>`;
     rows.appendChild(tr);
   }
 }
+
+async function refresh() {
+  let st;
+  try { st = await (await fetch('/api/status')).json(); }
+  catch { document.getElementById('conn').className = 'dot down'; return; }
+  lastStatus = st;
+  document.getElementById('conn').className = 'dot ' + (st.connected ? 'up' : 'down');
+  document.getElementById('server').textContent = st.server;
+  document.getElementById('uptime').textContent = fmtDur(st.uptime_secs);
+  document.getElementById('range').textContent = st.max_port ? `(allowed ${st.min_port}-${st.max_port})` : '';
+  const editRange = document.querySelector('[data-edit-range]');
+  if (editRange) editRange.textContent = st.max_port ? `(allowed ${st.min_port}-${st.max_port})` : '';
+  const pauseState = document.getElementById('pauseState');
+  pauseState.textContent = st.paused ? 'paused' : 'running';
+  pauseState.className = 'pill' + (st.paused ? ' paused' : '');
+  const pauseBtn = document.getElementById('pauseBtn');
+  pauseBtn.textContent = st.paused ? 'Unpause all' : 'Pause all';
+  pauseBtn.dataset.paused = st.paused ? '1' : '0';
+  updateOverview(st);
+  renderRows(st);
+}
+
+function syncAdvancedControls(form) {
+  const proto = form.querySelector('[data-proto]').value;
+  const proxy = form.querySelector('[data-proxy]');
+  const proxySelect = proxy.querySelector('select');
+  const mtu = form.querySelector('[data-mtu]');
+  const mtuInput = mtu.querySelector('input');
+  const pool = form.querySelector('[data-pool]');
+  const poolInput = pool.querySelector('input');
+  const tcp = proto === 'tcp';
+  const hasUdp = proto === 'udp' || proto === 'both';
+  proxy.hidden = !tcp; proxySelect.disabled = !tcp; if (!tcp) proxySelect.value = 'off';
+  mtu.hidden = !hasUdp; mtuInput.disabled = !hasUdp; if (!hasUdp) mtuInput.value = '';
+  pool.hidden = !hasUdp; poolInput.disabled = !hasUdp; if (!hasUdp) poolInput.value = '';
+}
+
+async function submitTunnel(form, errorEl, closeOnSuccess) {
+  errorEl.textContent = '';
+  const f = new FormData(form);
+  const body = { name: f.get('name'), proto: f.get('proto'), local: f.get('local') };
+  body.encrypted = f.get('encrypted') === 'true';
+  const rp = f.get('remote_port'); if (rp) body.remote_port = parseInt(rp, 10);
+  const mtu = f.get('udp_mtu'); if (mtu) body.udp_mtu = parseInt(mtu, 10);
+  const pool = f.get('udp_source_pool'); if (pool) body.udp_source_pool = pool;
+  const pp = f.get('proxy_protocol'); if (pp && pp !== 'off') body.proxy_protocol = pp;
+  const res = await fetch('/api/tunnels', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  if (res.ok) {
+    if (closeOnSuccess) document.getElementById('editor').close();
+    else form.reset();
+    syncAdvancedControls(form);
+    refresh();
+  } else {
+    errorEl.textContent = await res.text();
+  }
+}
+
+function openEditor(name) {
+  const tunnel = lastStatus && lastStatus.tunnels.find(t => t.name === name);
+  if (!tunnel) return;
+  const dialog = document.getElementById('editor');
+  const form = document.getElementById('edit');
+  const fields = form.elements;
+  const field = name => fields.namedItem(name);
+  field('name').value = tunnel.name;
+  field('proto').value = tunnel.proto;
+  field('encrypted').value = tunnel.encrypted ? 'true' : 'false';
+  field('local').value = formatLocalInput(tunnel);
+  field('remote_port').value = tunnel.remote_port || '';
+  field('udp_mtu').value = tunnel.udp_mtu || '';
+  field('udp_source_pool').value = tunnel.udp_source_pool || '';
+  field('proxy_protocol').value = tunnel.proxy_protocol || 'off';
+  document.getElementById('editError').textContent = '';
+  syncAdvancedControls(form);
+  dialog.showModal();
+}
+
 document.getElementById('rows').addEventListener('click', async e => {
   const copyBtn = e.target.closest('[data-copy]');
   if (copyBtn) {
     await copyText(copyBtn.dataset.copy);
     copyBtn.textContent = 'copied';
     copyBtn.disabled = true;
-    setTimeout(() => {
-      copyBtn.textContent = 'copy';
-      copyBtn.disabled = false;
-    }, 1000);
+    setTimeout(() => { copyBtn.textContent = 'copy'; copyBtn.disabled = false; }, 1000);
     return;
   }
+  const edit = e.target.getAttribute('data-edit');
   const tg = e.target.getAttribute('data-toggle');
   const rm = e.target.getAttribute('data-remove');
+  if (edit) openEditor(edit);
   if (tg) await fetch(`/api/tunnels/${encodeURIComponent(tg)}/toggle`, {method:'POST'});
-  if (rm) await fetch(`/api/tunnels/${encodeURIComponent(rm)}`, {method:'DELETE'});
+  if (rm && confirm(`Remove tunnel "${rm}"?`)) await fetch(`/api/tunnels/${encodeURIComponent(rm)}`, {method:'DELETE'});
   if (tg || rm) refresh();
 });
 document.getElementById('pauseBtn').addEventListener('click', async e => {
@@ -490,47 +729,22 @@ document.getElementById('pauseBtn').addEventListener('click', async e => {
   await fetch(paused ? '/api/tunnels/unpause' : '/api/tunnels/pause', {method:'POST'});
   refresh();
 });
-function syncProxyControl() {
-  const proto = document.getElementById('protoSelect').value;
-  const label = document.getElementById('proxyLabel');
-  const select = label.querySelector('select');
-  const mtuLabel = document.getElementById('mtuLabel');
-  const mtuInput = mtuLabel.querySelector('input');
-  const poolLabel = document.getElementById('poolLabel');
-  const poolInput = poolLabel.querySelector('input');
-  const tcp = proto === 'tcp';
-  const hasUdp = proto === 'udp' || proto === 'both';
-  label.hidden = !tcp;
-  select.disabled = !tcp;
-  if (!tcp) select.value = 'off';
-  mtuLabel.hidden = !hasUdp;
-  mtuInput.disabled = !hasUdp;
-  if (!hasUdp) mtuInput.value = '';
-  poolLabel.hidden = !hasUdp;
-  poolInput.disabled = !hasUdp;
-  if (!hasUdp) poolInput.value = '';
+document.getElementById('closeEditor').addEventListener('click', () => document.getElementById('editor').close());
+for (const form of [document.getElementById('add'), document.getElementById('edit')]) {
+  form.querySelector('[data-proto]').addEventListener('change', () => syncAdvancedControls(form));
+  syncAdvancedControls(form);
 }
-document.getElementById('protoSelect').addEventListener('change', syncProxyControl);
-document.getElementById('add').addEventListener('submit', async e => {
+document.getElementById('add').addEventListener('submit', e => {
   e.preventDefault();
-  const f = new FormData(e.target);
-  const body = { name: f.get('name'), proto: f.get('proto'), local: f.get('local') };
-  body.encrypted = f.get('encrypted') === 'true';
-  const rp = f.get('remote_port');
-  if (rp) body.remote_port = parseInt(rp, 10);
-  const mtu = f.get('udp_mtu');
-  if (mtu) body.udp_mtu = parseInt(mtu, 10);
-  const pool = f.get('udp_source_pool');
-  if (pool) body.udp_source_pool = pool;
-  const pp = f.get('proxy_protocol');
-  if (pp && pp !== 'off') body.proxy_protocol = pp;
-  const res = await fetch('/api/tunnels', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  if (res.ok) { e.target.reset(); syncProxyControl(); refresh(); }
-  else alert(await res.text());
+  submitTunnel(e.target, document.getElementById('addError'), false);
 });
-syncProxyControl();
+document.getElementById('edit').addEventListener('submit', e => {
+  e.preventDefault();
+  submitTunnel(e.target, document.getElementById('editError'), true);
+});
 refresh();
-setInterval(refresh, 1500);
+setInterval(refresh, 1000);
+window.addEventListener('resize', () => lastStatus && updateOverview(lastStatus));
 </script>
 </body>
 </html>

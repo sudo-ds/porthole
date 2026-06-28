@@ -121,6 +121,8 @@ pub enum ClientMessage {
         name: String,
         proto: Proto,
         remote_port: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_ports: Option<String>,
         #[serde(default)]
         encrypted: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -131,6 +133,19 @@ pub enum ClientMessage {
         name: String,
     },
     Heartbeat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedBinding {
+    pub local_port: u16,
+    pub remote_port: u16,
+    pub public_addr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_auth_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_mtu: Option<u16>,
 }
 
 /// Sent server -> client.
@@ -154,6 +169,8 @@ pub enum ServerMessage {
         udp_auth_key: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         udp_mtu: Option<u16>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        bindings: Vec<AcceptedBinding>,
     },
     /// A registration was refused (port out of range, already in use, ...).
     Rejected {
@@ -164,6 +181,8 @@ pub enum ServerMessage {
     NewConn {
         id: Uuid,
         tunnel: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_port: Option<u16>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         src_addr: Option<SocketAddr>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -696,6 +715,7 @@ mod tests {
                 name: "mc".into(),
                 proto: Proto::Tcp,
                 remote_port: Some(25565),
+                local_ports: None,
                 encrypted: false,
                 udp_mtu: None,
             },
@@ -703,6 +723,7 @@ mod tests {
                 name: "g".into(),
                 proto: Proto::Udp,
                 remote_port: None,
+                local_ports: Some("19132-19134".into()),
                 encrypted: false,
                 udp_mtu: Some(DEFAULT_UDP_MTU),
             },
@@ -724,10 +745,46 @@ mod tests {
             token: Some(Uuid::nil()),
             udp_auth_key: None,
             udp_mtu: Some(DEFAULT_UDP_MTU),
+            bindings: vec![AcceptedBinding {
+                local_port: 25565,
+                remote_port: 25565,
+                public_addr: "203.0.113.7:25565".into(),
+                token: Some(Uuid::nil()),
+                udp_auth_key: None,
+                udp_mtu: Some(DEFAULT_UDP_MTU),
+            }],
         };
         let j = serde_json::to_vec(&s).unwrap();
         let back: ServerMessage = serde_json::from_slice(&j).unwrap();
         assert_eq!(s, back);
+    }
+
+    #[test]
+    fn old_single_port_messages_deserialize_without_new_fields() {
+        let register: ClientMessage = serde_json::from_str(
+            r#"{"Register":{"name":"mc","proto":"tcp","remote_port":25565,"encrypted":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            register,
+            ClientMessage::Register {
+                name: "mc".into(),
+                proto: Proto::Tcp,
+                remote_port: Some(25565),
+                local_ports: None,
+                encrypted: false,
+                udp_mtu: None,
+            }
+        );
+
+        let accepted: ServerMessage = serde_json::from_str(
+            r#"{"Accepted":{"name":"mc","proto":"tcp","public_addr":"127.0.0.1:25565","remote_port":25565,"encrypted":false,"token":null}}"#,
+        )
+        .unwrap();
+        match accepted {
+            ServerMessage::Accepted { bindings, .. } => assert!(bindings.is_empty()),
+            other => panic!("expected Accepted, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -738,6 +795,7 @@ mod tests {
         let sent = ServerMessage::NewConn {
             id: Uuid::nil(),
             tunnel: "mc".into(),
+            local_port: Some(25565),
             src_addr: Some("203.0.113.7:51820".parse().unwrap()),
             dst_addr: Some("198.51.100.10:25565".parse().unwrap()),
             encrypted: false,

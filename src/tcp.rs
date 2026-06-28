@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use dashmap::DashMap;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -42,6 +42,7 @@ pub struct PendingTcp {
 pub struct ClientConn {
     pub id: Uuid,
     pub tunnel: String,
+    pub local_port: Option<u16>,
     pub src_addr: Option<SocketAddr>,
     pub dst_addr: Option<SocketAddr>,
     pub encrypted: bool,
@@ -50,6 +51,7 @@ pub struct ClientConn {
 
 struct UserConn {
     tunnel: String,
+    local_port: u16,
     encrypted: bool,
     src_addr: Option<SocketAddr>,
     dst_addr: Option<SocketAddr>,
@@ -64,6 +66,7 @@ const SPLICE_BUF: usize = 64 * 1024;
 pub async fn server_listener(
     listener: TcpListener,
     tunnel: String,
+    local_port: u16,
     encrypted: bool,
     control_tx: mpsc::Sender<ServerMessage>,
     pending: PendingMap,
@@ -84,6 +87,7 @@ pub async fn server_listener(
                     user,
                     UserConn {
                         tunnel: tunnel.clone(),
+                        local_port,
                         encrypted,
                         src_addr: Some(peer),
                         dst_addr: dst,
@@ -123,6 +127,7 @@ async fn accept_user_conn<User>(
         .send(ServerMessage::NewConn {
             id,
             tunnel: conn.tunnel,
+            local_port: (conn.local_port != 0).then_some(conn.local_port),
             src_addr: conn.src_addr,
             dst_addr: conn.dst_addr,
             encrypted: conn.encrypted,
@@ -170,14 +175,21 @@ pub async fn client_handle_conn(
     cancel: CancellationToken,
 ) {
     let (local, proxy_protocol, counters) = match shared.status.get(&conn.tunnel) {
-        Some(s) => (s.local_addr, s.proxy_protocol, s.counters.clone()),
+        Some(s) => {
+            let local = conn
+                .local_port
+                .map(|port| SocketAddr::new(s.local_addr.ip(), port))
+                .unwrap_or(s.local_addr);
+            (local, s.proxy_protocol, s.counters.clone())
+        }
         None => {
             tracing::warn!("NewConn for unknown tunnel '{}'", conn.tunnel);
             return;
         }
     };
 
-    let mut data: BoxedRelayIo = if conn.encrypted {
+    let setup_started = std::time::Instant::now();
+    let data: BoxedRelayIo = if conn.encrypted {
         match crate::client::connect_data_wire(&shared, conn.id).await {
             Ok(w) => Box::new(protocol::into_raw(w)),
             Err(e) => {
@@ -210,6 +222,7 @@ pub async fn client_handle_conn(
         }
     };
     net::set_keepalive(&local_stream);
+    counters.tcp_setup_latency.record(setup_started.elapsed());
 
     if !proxy_protocol.is_off() {
         let (Some(src), Some(dst)) = (conn.src_addr, conn.dst_addr) else {
@@ -238,14 +251,45 @@ pub async fn client_handle_conn(
     counters.active.fetch_add(1, Relaxed);
     tokio::select! {
         _ = cancel.cancelled() => {}
-        r = tokio::io::copy_bidirectional_with_sizes(&mut data, &mut local_stream, SPLICE_BUF, SPLICE_BUF) => {
-            if let Ok((into_local, out_remote)) = r {
-                counters.bytes_in.fetch_add(into_local, Relaxed);
-                counters.bytes_out.fetch_add(out_remote, Relaxed);
-            }
-        }
+        _ = copy_bidirectional_metered(data, local_stream, counters.clone()) => {}
     }
     counters.active.fetch_sub(1, Relaxed);
+}
+
+async fn copy_bidirectional_metered(
+    data: BoxedRelayIo,
+    local_stream: TcpStream,
+    counters: Arc<crate::client::Counters>,
+) {
+    let (mut data_reader, mut data_writer) = tokio::io::split(data);
+    let (mut local_reader, mut local_writer) = local_stream.into_split();
+    let into_local = copy_metered(&mut data_reader, &mut local_writer, &counters.bytes_in);
+    let out_remote = copy_metered(&mut local_reader, &mut data_writer, &counters.bytes_out);
+    tokio::pin!(into_local);
+    tokio::pin!(out_remote);
+    tokio::select! {
+        _ = &mut into_local => {}
+        _ = &mut out_remote => {}
+    }
+}
+
+async fn copy_metered<R, W>(reader: &mut R, writer: &mut W, counter: &std::sync::atomic::AtomicU64)
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; SPLICE_BUF];
+    loop {
+        let n = match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        if writer.write_all(&buf[..n]).await.is_err() {
+            break;
+        }
+        counter.fetch_add(n as u64, Relaxed);
+    }
+    let _ = writer.shutdown().await;
 }
 
 fn proxy_header(mode: ProxyProtocol, src: SocketAddr, dst: SocketAddr) -> Result<Vec<u8>> {
@@ -318,6 +362,7 @@ mod tests {
             server_side,
             UserConn {
                 tunnel: "mock-tunnel".into(),
+                local_port: 25565,
                 encrypted: false,
                 src_addr: Some("203.0.113.7:51820".parse().unwrap()),
                 dst_addr: Some("198.51.100.10:25565".parse().unwrap()),
@@ -331,6 +376,7 @@ mod tests {
         let ServerMessage::NewConn {
             id,
             tunnel,
+            local_port,
             src_addr,
             dst_addr,
             encrypted,
@@ -340,6 +386,7 @@ mod tests {
             panic!("expected NewConn");
         };
         assert_eq!(tunnel, "mock-tunnel");
+        assert_eq!(local_port, Some(25565));
         assert_eq!(src_addr, Some("203.0.113.7:51820".parse().unwrap()));
         assert_eq!(dst_addr, Some("198.51.100.10:25565".parse().unwrap()));
         assert!(!encrypted);
@@ -383,6 +430,7 @@ mod tests {
             server_side,
             UserConn {
                 tunnel: "mock-tunnel".into(),
+                local_port: 25565,
                 encrypted: false,
                 src_addr: None,
                 dst_addr: None,

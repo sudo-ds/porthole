@@ -31,6 +31,8 @@ max_files = 14      # 0 disables pruning
 # Each tunnel exposes a local service on a public port of the server.
 # protocol can be "tcp", "udp", or "both"; "both" binds TCP and UDP to the same public port.
 # remote_port is optional (omit or 0 => the server assigns one).
+# local_ports is optional; use "4000-6000" for an inclusive contiguous range or
+# "1000,2000" for a sparse list. The first local_ports entry must match local_addr's port.
 # encrypted defaults to false for the data channel. Set true to wrap data in TLS.
 # UDP-capable tunnels can set udp_mtu (default 1200, range 256-65507) for plaintext fragmentation.
 # Experimental: UDP-capable loopback tunnels can set udp_source_pool to make distinct
@@ -54,3 +56,12 @@ enabled = true
 encrypted = false
 udp_mtu = 1200
 # udp_source_pool = "127.64.0.0/16"
+
+# Multi-port tunnel example. With remote_port omitted, the relay allocates the first
+# available public block of the same size.
+# [[tunnels]]
+# name = "game-range"
+# protocol = "udp"
+# local_addr = "127.0.0.1:4000"
+# local_ports = "4000-4010"
+# encrypted = false

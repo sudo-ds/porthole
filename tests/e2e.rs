@@ -25,6 +25,30 @@ fn free_port() -> u16 {
     p
 }
 
+fn free_port_block(count: u16) -> u16 {
+    loop {
+        let start = free_port();
+        if start > u16::MAX - count {
+            continue;
+        }
+        let mut listeners = Vec::new();
+        let mut ok = true;
+        for port in start..start + count {
+            match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                Ok(listener) => listeners.push(listener),
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        drop(listeners);
+        if ok {
+            return start;
+        }
+    }
+}
+
 fn temp_paths(tag: &str) -> (PathBuf, PathBuf) {
     let dir = std::env::temp_dir().join(format!("porthole-e2e-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -62,6 +86,42 @@ async fn tcp_echo() -> SocketAddr {
         }
     });
     addr
+}
+
+async fn tcp_labeled_pair() -> SocketAddr {
+    loop {
+        let base = free_port_block(2);
+        let first = TcpListener::bind(("127.0.0.1", base)).await;
+        let second = TcpListener::bind(("127.0.0.1", base + 1)).await;
+        let (Ok(first), Ok(second)) = (first, second) else {
+            continue;
+        };
+        spawn_tcp_labeled_echo(first, b"a:");
+        spawn_tcp_labeled_echo(second, b"b:");
+        return SocketAddr::from(([127, 0, 0, 1], base));
+    }
+}
+
+fn spawn_tcp_labeled_echo(listener: TcpListener, prefix: &'static [u8]) {
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match s.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if s.write_all(prefix).await.is_err()
+                                || s.write_all(&buf[..n]).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
 }
 
 async fn tcp_proxy_echo(
@@ -190,6 +250,32 @@ async fn udp_echo() -> SocketAddr {
         }
     });
     addr
+}
+
+async fn udp_labeled_pair() -> SocketAddr {
+    loop {
+        let base = free_port_block(2);
+        let first = UdpSocket::bind(("127.0.0.1", base)).await;
+        let second = UdpSocket::bind(("127.0.0.1", base + 1)).await;
+        let (Ok(first), Ok(second)) = (first, second) else {
+            continue;
+        };
+        spawn_udp_labeled_echo(first, b"a:");
+        spawn_udp_labeled_echo(second, b"b:");
+        return SocketAddr::from(([127, 0, 0, 1], base));
+    }
+}
+
+fn spawn_udp_labeled_echo(socket: UdpSocket, prefix: &'static [u8]) {
+    tokio::spawn(async move {
+        let mut buf = [0u8; 65535];
+        while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
+            let mut out = Vec::with_capacity(prefix.len() + n);
+            out.extend_from_slice(prefix);
+            out.extend_from_slice(&buf[..n]);
+            let _ = socket.send_to(&out, peer).await;
+        }
+    });
 }
 
 async fn udp_peer_report_echo() -> (SocketAddr, mpsc::Receiver<SocketAddr>) {
@@ -428,6 +514,7 @@ async fn tcp_tunnel_roundtrip() {
         protocol: Proto::Tcp,
         local_addr: echo,
         remote_port: Some(public),
+        local_ports: None,
         enabled: true,
         encrypted: false,
         udp_mtu: None,
@@ -462,6 +549,7 @@ async fn tcp_tunnel_encrypted_roundtrip() {
         protocol: Proto::Tcp,
         local_addr: echo,
         remote_port: Some(public),
+        local_ports: None,
         enabled: true,
         encrypted: true,
         udp_mtu: None,
@@ -480,6 +568,98 @@ async fn tcp_tunnel_encrypted_roundtrip() {
 
 #[tokio::test]
 #[ignore = "uses real loopback sockets; run explicitly for relay smoke testing"]
+async fn tcp_range_tunnel_maps_distinct_local_ports() {
+    install();
+    let local = tcp_labeled_pair().await;
+    let (ingress, public) = (free_port(), free_port_block(2));
+    let (cert, key) = temp_paths("tcp-range");
+    let ss = ServerSettings {
+        bind_addr: "127.0.0.1".into(),
+        control_port: ingress,
+        secret: "test-secret".into(),
+        min_port: public,
+        max_port: public + 1,
+        cert_path: cert,
+        key_path: key,
+        public_host: None,
+    };
+    let (_acceptor, fingerprint) = tls::server_acceptor(&ss).expect("generate cert");
+    tokio::spawn(server::run(ss));
+    let tunnel = TunnelConfig {
+        name: "range".into(),
+        protocol: Proto::Tcp,
+        local_addr: local,
+        remote_port: Some(public),
+        local_ports: Some(format!("{}-{}", local.port(), local.port() + 1)),
+        enabled: true,
+        encrypted: false,
+        udp_mtu: None,
+        udp_source_pool: None,
+        proxy_protocol: ProxyProtocol::Off,
+    };
+    tokio::spawn(client::run(client_settings(ingress, fingerprint, tunnel)));
+
+    let mut first = connect_retry(format!("127.0.0.1:{public}").parse().unwrap()).await;
+    first.write_all(b"one").await.unwrap();
+    let mut buf = [0u8; 5];
+    first.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"a:one");
+
+    let mut second = connect_retry(format!("127.0.0.1:{}", public + 1).parse().unwrap()).await;
+    second.write_all(b"two").await.unwrap();
+    let mut buf = [0u8; 5];
+    second.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"b:two");
+}
+
+#[tokio::test]
+#[ignore = "uses real loopback sockets; run explicitly for relay smoke testing"]
+async fn tcp_list_tunnel_maps_distinct_local_ports_to_first_free_public_ports() {
+    install();
+    let local = tcp_labeled_pair().await;
+    let (ingress, public) = (free_port(), free_port_block(2));
+    let (cert, key) = temp_paths("tcp-list");
+    let ss = ServerSettings {
+        bind_addr: "127.0.0.1".into(),
+        control_port: ingress,
+        secret: "test-secret".into(),
+        min_port: public,
+        max_port: public + 1,
+        cert_path: cert,
+        key_path: key,
+        public_host: None,
+    };
+    let (_acceptor, fingerprint) = tls::server_acceptor(&ss).expect("generate cert");
+    tokio::spawn(server::run(ss));
+    let tunnel = TunnelConfig {
+        name: "list".into(),
+        protocol: Proto::Tcp,
+        local_addr: local,
+        remote_port: None,
+        local_ports: Some(format!("{},{}", local.port(), local.port() + 1)),
+        enabled: true,
+        encrypted: false,
+        udp_mtu: None,
+        udp_source_pool: None,
+        proxy_protocol: ProxyProtocol::Off,
+    };
+    tokio::spawn(client::run(client_settings(ingress, fingerprint, tunnel)));
+
+    let mut first = connect_retry(format!("127.0.0.1:{public}").parse().unwrap()).await;
+    first.write_all(b"one").await.unwrap();
+    let mut buf = [0u8; 5];
+    first.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"a:one");
+
+    let mut second = connect_retry(format!("127.0.0.1:{}", public + 1).parse().unwrap()).await;
+    second.write_all(b"two").await.unwrap();
+    let mut buf = [0u8; 5];
+    second.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"b:two");
+}
+
+#[tokio::test]
+#[ignore = "uses real loopback sockets; run explicitly for relay smoke testing"]
 async fn tcp_tunnel_proxy_protocol_v1_forwards_source_metadata() {
     install();
     let (ingress, public) = (free_port(), free_port());
@@ -489,6 +669,7 @@ async fn tcp_tunnel_proxy_protocol_v1_forwards_source_metadata() {
         protocol: Proto::Tcp,
         local_addr: echo,
         remote_port: Some(public),
+        local_ports: None,
         enabled: true,
         encrypted: false,
         udp_mtu: None,
@@ -517,6 +698,7 @@ async fn tcp_tunnel_proxy_protocol_v2_forwards_source_metadata() {
         protocol: Proto::Tcp,
         local_addr: echo,
         remote_port: Some(public),
+        local_ports: None,
         enabled: true,
         encrypted: false,
         udp_mtu: None,
@@ -550,6 +732,7 @@ async fn paused_client_does_not_register_enabled_tunnels() {
         protocol: Proto::Tcp,
         local_addr: echo,
         remote_port: Some(public),
+        local_ports: None,
         enabled: true,
         encrypted: false,
         udp_mtu: None,
@@ -603,6 +786,7 @@ async fn web_pause_persists_drops_active_tcp_and_unpause_restores_enabled_only()
         protocol: Proto::Tcp,
         local_addr: echo,
         remote_port: Some(enabled_port),
+        local_ports: None,
         enabled: true,
         encrypted: false,
         udp_mtu: None,
@@ -614,6 +798,7 @@ async fn web_pause_persists_drops_active_tcp_and_unpause_restores_enabled_only()
         protocol: Proto::Tcp,
         local_addr: echo,
         remote_port: Some(disabled_port),
+        local_ports: None,
         enabled: false,
         encrypted: false,
         udp_mtu: None,
@@ -671,6 +856,7 @@ async fn udp_tunnel_roundtrip() {
         protocol: Proto::Udp,
         local_addr: echo,
         remote_port: Some(public),
+        local_ports: None,
         enabled: true,
         encrypted: false,
         udp_mtu: None,
@@ -700,6 +886,70 @@ async fn udp_tunnel_roundtrip() {
 
 #[tokio::test]
 #[ignore = "uses real loopback sockets; run explicitly for relay smoke testing"]
+async fn udp_range_tunnel_maps_two_public_bindings() {
+    install();
+    let local = udp_labeled_pair().await;
+    let (ingress, public) = (free_port(), free_port_block(2));
+    let (cert, key) = temp_paths("udp-range");
+    let ss = ServerSettings {
+        bind_addr: "127.0.0.1".into(),
+        control_port: ingress,
+        secret: "test-secret".into(),
+        min_port: public,
+        max_port: public + 1,
+        cert_path: cert,
+        key_path: key,
+        public_host: None,
+    };
+    let (_acceptor, fingerprint) = tls::server_acceptor(&ss).expect("generate cert");
+    tokio::spawn(server::run(ss));
+    let tunnel = TunnelConfig {
+        name: "udp-range".into(),
+        protocol: Proto::Udp,
+        local_addr: local,
+        remote_port: Some(public),
+        local_ports: Some(format!("{}-{}", local.port(), local.port() + 1)),
+        enabled: true,
+        encrypted: false,
+        udp_mtu: None,
+        udp_source_pool: None,
+        proxy_protocol: ProxyProtocol::Off,
+    };
+    tokio::spawn(client::run(client_settings(ingress, fingerprint, tunnel)));
+
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut buf = [0u8; 64];
+    let mut first = None;
+    for _ in 0..100 {
+        let _ = sock.send_to(b"one", format!("127.0.0.1:{public}")).await;
+        match tokio::time::timeout(Duration::from_millis(150), sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) => {
+                first = Some(buf[..n].to_vec());
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    assert_eq!(first.as_deref(), Some(b"a:one".as_slice()));
+
+    let mut second = None;
+    for _ in 0..100 {
+        let _ = sock
+            .send_to(b"two", format!("127.0.0.1:{}", public + 1))
+            .await;
+        match tokio::time::timeout(Duration::from_millis(150), sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) => {
+                second = Some(buf[..n].to_vec());
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    assert_eq!(second.as_deref(), Some(b"b:two".as_slice()));
+}
+
+#[tokio::test]
+#[ignore = "uses real loopback sockets; run explicitly for relay smoke testing"]
 async fn plaintext_udp_diagnostics_appear_in_web_status() {
     install();
     let echo = udp_echo().await;
@@ -714,6 +964,7 @@ async fn plaintext_udp_diagnostics_appear_in_web_status() {
         protocol: Proto::Udp,
         local_addr: echo,
         remote_port: Some(public),
+        local_ports: None,
         enabled: true,
         encrypted: false,
         udp_mtu: None,
@@ -760,6 +1011,7 @@ async fn udp_source_pool_presents_distinct_loopback_sources() {
         protocol: Proto::Udp,
         local_addr: local,
         remote_port: Some(public),
+        local_ports: None,
         enabled: true,
         encrypted: false,
         udp_mtu: None,
@@ -836,6 +1088,7 @@ async fn udp_plaintext_large_safe_datagram_roundtrip() {
         protocol: Proto::Udp,
         local_addr: echo,
         remote_port: Some(public),
+        local_ports: None,
         enabled: true,
         encrypted: false,
         udp_mtu: None,
@@ -873,6 +1126,7 @@ async fn udp_plaintext_fragmented_datagram_roundtrip() {
         protocol: Proto::Udp,
         local_addr: echo,
         remote_port: Some(public),
+        local_ports: None,
         enabled: true,
         encrypted: false,
         udp_mtu: Some(512),
@@ -910,6 +1164,7 @@ async fn udp_encrypted_large_datagram_roundtrip() {
         protocol: Proto::Udp,
         local_addr: echo,
         remote_port: Some(public),
+        local_ports: None,
         enabled: true,
         encrypted: true,
         udp_mtu: None,
@@ -950,6 +1205,7 @@ async fn both_tunnel_roundtrip() {
         protocol: Proto::Both,
         local_addr: echo,
         remote_port: Some(public),
+        local_ports: None,
         enabled: true,
         encrypted: false,
         udp_mtu: None,
@@ -979,6 +1235,7 @@ async fn both_tunnel_encrypted_roundtrip() {
         protocol: Proto::Both,
         local_addr: echo,
         remote_port: Some(public),
+        local_ports: None,
         enabled: true,
         encrypted: true,
         udp_mtu: None,
@@ -1128,6 +1385,7 @@ async fn client_reconnects_when_server_starts_late() {
         protocol: Proto::Tcp,
         local_addr: echo,
         remote_port: Some(public),
+        local_ports: None,
         enabled: true,
         encrypted: false,
         udp_mtu: None,
@@ -1206,6 +1464,7 @@ async fn out_of_range_register_is_rejected() {
             name: "x".into(),
             proto: Proto::Tcp,
             remote_port: Some(bad),
+            local_ports: None,
             encrypted: false,
             udp_mtu: None,
         },

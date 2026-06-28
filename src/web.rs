@@ -61,7 +61,26 @@ struct StatusResponse {
     uptime_secs: u64,
     min_port: u16,
     max_port: u16,
+    metrics: MetricsView,
     tunnels: Vec<TunnelView>,
+}
+
+#[derive(Serialize)]
+struct MetricsView {
+    in_bps: u64,
+    out_bps: u64,
+    active: u32,
+    latency_ms: Option<f64>,
+    history: Vec<MetricSampleView>,
+}
+
+#[derive(Serialize)]
+struct MetricSampleView {
+    uptime_secs: u64,
+    in_bps: u64,
+    out_bps: u64,
+    active: u32,
+    latency_ms: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -70,18 +89,30 @@ struct TunnelView {
     proto: String,
     local: String,
     remote_port: Option<u16>,
+    local_ports: Option<String>,
     encrypted: bool,
     udp_mtu: Option<u16>,
     udp_source_pool: Option<String>,
     proxy_protocol: String,
     public: Option<String>,
+    bindings: Vec<BindingView>,
     enabled: bool,
     up: bool,
     error: Option<String>,
     bytes_in: u64,
     bytes_out: u64,
+    rate_in_bps: u64,
+    rate_out_bps: u64,
     active: u32,
+    latency_ms: Option<f64>,
     diagnostics: Option<DiagnosticsView>,
+}
+
+#[derive(Serialize)]
+struct BindingView {
+    local_port: u16,
+    remote_port: u16,
+    public: String,
 }
 
 #[derive(Serialize)]
@@ -108,17 +139,32 @@ async fn status(State(st): State<AppState>) -> Json<StatusResponse> {
                 proto: s.proto.to_string(),
                 local: s.local_addr.to_string(),
                 remote_port: s.remote_port,
+                local_ports: s.local_ports.clone(),
                 encrypted: s.encrypted,
                 udp_mtu: s.udp_mtu,
                 udp_source_pool: s.udp_source_pool.map(|p| p.to_string()),
                 proxy_protocol: s.proxy_protocol.to_string(),
                 public: s.public_addr.lock().unwrap().clone(),
+                bindings: s
+                    .bindings
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|binding| BindingView {
+                        local_port: binding.local_port,
+                        remote_port: binding.remote_port,
+                        public: binding.public.clone(),
+                    })
+                    .collect(),
                 enabled: s.enabled.load(Relaxed),
                 up: s.up.load(Relaxed),
                 error: s.error.lock().unwrap().clone(),
                 bytes_in: s.counters.bytes_in.load(Relaxed),
                 bytes_out: s.counters.bytes_out.load(Relaxed),
+                rate_in_bps: s.rate_in_bps.load(Relaxed),
+                rate_out_bps: s.rate_out_bps.load(Relaxed),
                 active: s.counters.active.load(Relaxed),
+                latency_ms: tunnel_latency_ms(s),
                 diagnostics: (s.proto.has_udp() && !s.encrypted)
                     .then(|| diagnostics_view(&s.diagnostics)),
             }
@@ -133,8 +179,44 @@ async fn status(State(st): State<AppState>) -> Json<StatusResponse> {
         uptime_secs: shared.started.elapsed().as_secs(),
         min_port: shared.min_port.load(Relaxed),
         max_port: shared.max_port.load(Relaxed),
+        metrics: metrics_view(shared),
         tunnels,
     })
+}
+
+fn metrics_view(shared: &ClientShared) -> MetricsView {
+    let metrics = shared.metrics.lock().unwrap();
+    let last = metrics.samples.back().cloned().unwrap_or_default();
+    MetricsView {
+        in_bps: last.bytes_in_per_sec,
+        out_bps: last.bytes_out_per_sec,
+        active: last.active,
+        latency_ms: last.latency_ms,
+        history: metrics
+            .samples
+            .iter()
+            .map(|sample| MetricSampleView {
+                uptime_secs: sample.uptime_secs,
+                in_bps: sample.bytes_in_per_sec,
+                out_bps: sample.bytes_out_per_sec,
+                active: sample.active,
+                latency_ms: sample.latency_ms,
+            })
+            .collect(),
+    }
+}
+
+fn tunnel_latency_ms(s: &crate::client::TunnelStatus) -> Option<f64> {
+    s.diagnostics
+        .rtt
+        .snapshot()
+        .map(|snapshot| us_to_ms(snapshot.last_us))
+        .or_else(|| {
+            s.counters
+                .tcp_setup_latency
+                .snapshot()
+                .map(|snapshot| us_to_ms(snapshot.last_us))
+        })
 }
 
 fn diagnostics_view(d: &PlainUdpDiagnostics) -> DiagnosticsView {
@@ -190,6 +272,7 @@ struct AddRequest {
     proto: String,
     local: String,
     remote_port: Option<u16>,
+    local_ports: Option<String>,
     encrypted: Option<bool>,
     udp_mtu: Option<u16>,
     udp_source_pool: Option<String>,
@@ -206,12 +289,13 @@ async fn add_tunnel(State(st): State<AppState>, Json(req): Json<AddRequest>) -> 
             return (StatusCode::BAD_REQUEST, "proto must be tcp, udp, or both").into_response()
         }
     };
-    let local_addr = match parse_local_addr(&req.local) {
+    let (local_addr, parsed_local_ports) = match parse_local_endpoint(&req.local) {
         Ok(a) => a,
         Err(_) => {
             return (StatusCode::BAD_REQUEST, "local must be HOST:PORT or PORT").into_response();
         }
     };
+    let local_ports = req.local_ports.or(parsed_local_ports);
     let proxy_protocol = match req.proxy_protocol.as_deref().unwrap_or("off").parse() {
         Ok(p) => p,
         Err(_) => {
@@ -259,6 +343,7 @@ async fn add_tunnel(State(st): State<AppState>, Json(req): Json<AddRequest>) -> 
         protocol: proto,
         local_addr,
         remote_port: req.remote_port.filter(|p| *p != 0),
+        local_ports,
         enabled: true,
         encrypted: req.encrypted.unwrap_or(false),
         udp_mtu: req.udp_mtu,
@@ -298,15 +383,12 @@ async fn unpause_tunnels(State(st): State<AppState>) -> impl IntoResponse {
     StatusCode::OK
 }
 
-fn parse_local_addr(local: &str) -> Result<SocketAddr, std::net::AddrParseError> {
+fn parse_local_endpoint(local: &str) -> Result<(SocketAddr, Option<String>)> {
     let local = local.trim();
-    match local.parse::<SocketAddr>() {
-        Ok(addr) => Ok(addr),
-        Err(err) => match local.parse::<u16>() {
-            Ok(port) => Ok(SocketAddr::from(([127, 0, 0, 1], port))),
-            Err(_) => Err(err),
-        },
+    if let Ok(port) = local.parse::<u16>() {
+        return Ok((SocketAddr::from(([127, 0, 0, 1], port)), None));
     }
+    config::parse_local_endpoint(local)
 }
 
 #[cfg(test)]
@@ -314,23 +396,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_local_addr_keeps_explicit_addr() {
+    fn parse_local_endpoint_keeps_explicit_addr() {
         assert_eq!(
-            parse_local_addr("192.0.2.10:4040").unwrap(),
-            "192.0.2.10:4040".parse::<SocketAddr>().unwrap()
+            parse_local_endpoint("192.0.2.10:4040").unwrap(),
+            ("192.0.2.10:4040".parse::<SocketAddr>().unwrap(), None)
         );
     }
 
     #[test]
-    fn parse_local_addr_defaults_bare_port_to_loopback() {
+    fn parse_local_endpoint_defaults_bare_port_to_loopback() {
         assert_eq!(
-            parse_local_addr("4040").unwrap(),
-            "127.0.0.1:4040".parse::<SocketAddr>().unwrap()
+            parse_local_endpoint("4040").unwrap(),
+            ("127.0.0.1:4040".parse::<SocketAddr>().unwrap(), None)
         );
     }
 
     #[test]
-    fn parse_local_addr_rejects_garbage() {
-        assert!(parse_local_addr("badaddr").is_err());
+    fn parse_local_endpoint_accepts_range() {
+        assert_eq!(
+            parse_local_endpoint("127.0.0.1:4000-4002").unwrap(),
+            (
+                "127.0.0.1:4000".parse::<SocketAddr>().unwrap(),
+                Some("4000-4002".into())
+            )
+        );
+    }
+
+    #[test]
+    fn parse_local_endpoint_rejects_garbage() {
+        assert!(parse_local_endpoint("badaddr").is_err());
     }
 }

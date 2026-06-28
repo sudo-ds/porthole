@@ -1,6 +1,7 @@
 //! Tunnel client: maintains the control connection (with auto-reconnect), registers
 //! tunnels, dials data connections on demand, and exposes shared state to the web UI.
 
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering::Relaxed};
@@ -25,7 +26,7 @@ use crate::cli::{ClientArgs, JoinArgs};
 use crate::config::{
     self, save_client_file, ClientFile, ClientSettings, ProxyProtocol, TunnelConfig, UdpSourcePool,
 };
-use crate::diagnostics::PlainUdpDiagnostics;
+use crate::diagnostics::{LatencyStats, PlainUdpDiagnostics};
 use crate::invite;
 use crate::protocol::{
     self, ClientMessage, Proto, ServerMessage, Wire, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT,
@@ -41,6 +42,31 @@ pub struct Counters {
     pub bytes_in: AtomicU64,
     pub bytes_out: AtomicU64,
     pub active: AtomicU32,
+    pub tcp_setup_latency: LatencyStats,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TunnelBinding {
+    pub local_port: u16,
+    pub remote_port: u16,
+    pub public: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MetricsSample {
+    pub uptime_secs: u64,
+    pub bytes_in_per_sec: u64,
+    pub bytes_out_per_sec: u64,
+    pub active: u32,
+    pub latency_ms: Option<f64>,
+}
+
+#[derive(Default)]
+pub struct MetricsHistory {
+    pub samples: VecDeque<MetricsSample>,
+    last_in: u64,
+    last_out: u64,
+    last_by_tunnel: HashMap<String, (u64, u64)>,
 }
 
 /// Live status for one tunnel (shared with the web UI).
@@ -48,17 +74,21 @@ pub struct TunnelStatus {
     pub proto: Proto,
     pub local_addr: SocketAddr,
     pub remote_port: Option<u16>,
+    pub local_ports: Option<String>,
     pub encrypted: bool,
     pub udp_mtu: Option<u16>,
     pub udp_source_pool: Option<UdpSourcePool>,
     pub proxy_protocol: ProxyProtocol,
     pub enabled: AtomicBool,
     pub public_addr: Mutex<Option<String>>,
+    pub bindings: Mutex<Vec<TunnelBinding>>,
     pub up: AtomicBool,
     /// Last rejection reason from the server, if any (shown in the web UI).
     pub error: Mutex<Option<String>>,
     pub counters: Arc<Counters>,
     pub diagnostics: Arc<PlainUdpDiagnostics>,
+    pub rate_in_bps: AtomicU64,
+    pub rate_out_bps: AtomicU64,
 }
 
 /// State shared between the control loop, data tasks, and the web UI.
@@ -78,6 +108,7 @@ pub struct ClientShared {
     /// Allowed public-port range advertised by the server (0 = not yet known).
     pub min_port: AtomicU16,
     pub max_port: AtomicU16,
+    pub metrics: Mutex<MetricsHistory>,
     pub started: Instant,
     pub shutdown: CancellationToken,
 }
@@ -131,11 +162,13 @@ pub async fn run_with_shutdown(
         connected: AtomicBool::new(false),
         min_port: AtomicU16::new(0),
         max_port: AtomicU16::new(0),
+        metrics: Mutex::new(MetricsHistory::default()),
         started: Instant::now(),
         shutdown,
     });
 
     tokio::spawn(command_processor(shared.clone(), cmd_rx));
+    tokio::spawn(metrics_sampler(shared.clone()));
 
     {
         let shared = shared.clone();
@@ -275,16 +308,20 @@ fn status_from(t: &TunnelConfig) -> TunnelStatus {
         proto: t.protocol,
         local_addr: t.local_addr,
         remote_port: t.remote_port,
+        local_ports: t.local_ports.clone(),
         encrypted: t.encrypted,
         udp_mtu: config::resolved_udp_mtu(t.protocol, t.udp_mtu),
         udp_source_pool: t.udp_source_pool,
         proxy_protocol: t.proxy_protocol,
         enabled: AtomicBool::new(t.enabled),
         public_addr: Mutex::new(None),
+        bindings: Mutex::new(Vec::new()),
         up: AtomicBool::new(false),
         error: Mutex::new(None),
         counters: Arc::new(Counters::default()),
         diagnostics: Arc::new(PlainUdpDiagnostics::default()),
+        rate_in_bps: AtomicU64::new(0),
+        rate_out_bps: AtomicU64::new(0),
     }
 }
 
@@ -294,6 +331,7 @@ fn ensure_status(shared: &ClientShared, t: &TunnelConfig) {
             s.proto = t.protocol;
             s.local_addr = t.local_addr;
             s.remote_port = t.remote_port;
+            s.local_ports = t.local_ports.clone();
             s.encrypted = t.encrypted;
             s.udp_mtu = config::resolved_udp_mtu(t.protocol, t.udp_mtu);
             s.udp_source_pool = t.udp_source_pool;
@@ -340,6 +378,83 @@ async fn reconnect_supervisor(shared: Arc<ClientShared>) {
             _ = tokio::time::sleep(wait) => {}
         }
         backoff = (backoff * 2).min(max);
+    }
+}
+
+async fn metrics_sampler(shared: Arc<ClientShared>) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            _ = shared.shutdown.cancelled() => break,
+            _ = ticker.tick() => sample_metrics(&shared),
+        }
+    }
+}
+
+fn sample_metrics(shared: &ClientShared) {
+    let mut total_in = 0u64;
+    let mut total_out = 0u64;
+    let mut active = 0u32;
+    let mut latencies_us = Vec::new();
+    let mut current_by_tunnel = HashMap::new();
+
+    for entry in shared.status.iter() {
+        let name = entry.key().clone();
+        let status = entry.value();
+        let bytes_in = status.counters.bytes_in.load(Relaxed);
+        let bytes_out = status.counters.bytes_out.load(Relaxed);
+        total_in = total_in.saturating_add(bytes_in);
+        total_out = total_out.saturating_add(bytes_out);
+        active = active.saturating_add(status.counters.active.load(Relaxed));
+        current_by_tunnel.insert(name, (bytes_in, bytes_out));
+
+        if let Some(snapshot) = status.counters.tcp_setup_latency.snapshot() {
+            latencies_us.push(snapshot.last_us);
+        }
+        if let Some(snapshot) = status.diagnostics.rtt.snapshot() {
+            latencies_us.push(snapshot.last_us);
+        }
+    }
+
+    let mut metrics = shared.metrics.lock().unwrap();
+    let bytes_in_per_sec = total_in.saturating_sub(metrics.last_in);
+    let bytes_out_per_sec = total_out.saturating_sub(metrics.last_out);
+
+    for entry in shared.status.iter() {
+        let name = entry.key();
+        let status = entry.value();
+        let (bytes_in, bytes_out) = current_by_tunnel.get(name).copied().unwrap_or_default();
+        let (last_in, last_out) = metrics
+            .last_by_tunnel
+            .get(name)
+            .copied()
+            .unwrap_or_default();
+        status
+            .rate_in_bps
+            .store(bytes_in.saturating_sub(last_in).saturating_mul(8), Relaxed);
+        status.rate_out_bps.store(
+            bytes_out.saturating_sub(last_out).saturating_mul(8),
+            Relaxed,
+        );
+    }
+
+    metrics.last_in = total_in;
+    metrics.last_out = total_out;
+    metrics.last_by_tunnel = current_by_tunnel;
+    let latency_ms = if latencies_us.is_empty() {
+        None
+    } else {
+        Some(latencies_us.iter().sum::<u64>() as f64 / latencies_us.len() as f64 / 1000.0)
+    };
+    metrics.samples.push_back(MetricsSample {
+        uptime_secs: shared.started.elapsed().as_secs(),
+        bytes_in_per_sec: bytes_in_per_sec.saturating_mul(8),
+        bytes_out_per_sec: bytes_out_per_sec.saturating_mul(8),
+        active,
+        latency_ms,
+    });
+    while metrics.samples.len() > 300 {
+        metrics.samples.pop_front();
     }
 }
 
@@ -427,6 +542,7 @@ async fn connect_and_run(shared: &Arc<ClientShared>) -> Result<()> {
                 name: t.name.clone(),
                 proto: t.protocol,
                 remote_port: t.remote_port,
+                local_ports: config::tunnel_local_ports_spec(t).ok(),
                 encrypted: t.encrypted,
                 udp_mtu: t.udp_mtu,
             })
@@ -445,6 +561,7 @@ async fn connect_and_run(shared: &Arc<ClientShared>) -> Result<()> {
                 Ok(ServerMessage::NewConn {
                     id,
                     tunnel,
+                    local_port,
                     src_addr,
                     dst_addr,
                     encrypted,
@@ -455,6 +572,7 @@ async fn connect_and_run(shared: &Arc<ClientShared>) -> Result<()> {
                         tcp::ClientConn {
                             id,
                             tunnel,
+                            local_port,
                             src_addr,
                             dst_addr,
                             encrypted,
@@ -498,18 +616,66 @@ fn apply_accepted(shared: &Arc<ClientShared>, conn_cancel: &CancellationToken, m
         token,
         udp_auth_key,
         udp_mtu,
+        bindings,
         ..
     } = msg
     else {
         return;
     };
-    let public = public_endpoint(
-        shared.public_addr.as_deref(),
-        &shared.server_addr,
-        remote_port,
-    );
+
+    let accepted_bindings = if bindings.is_empty() {
+        vec![protocol::AcceptedBinding {
+            local_port: 0,
+            remote_port,
+            public_addr: String::new(),
+            token,
+            udp_auth_key,
+            udp_mtu,
+        }]
+    } else {
+        bindings
+    };
+
+    let display_bindings: Vec<TunnelBinding> = {
+        let base_port = shared
+            .status
+            .get(&name)
+            .map(|s| s.local_addr.port())
+            .unwrap_or_default();
+        accepted_bindings
+            .iter()
+            .map(|binding| {
+                let local_port = if binding.local_port == 0 {
+                    base_port
+                } else {
+                    binding.local_port
+                };
+                TunnelBinding {
+                    local_port,
+                    remote_port: binding.remote_port,
+                    public: public_endpoint(
+                        shared.public_addr.as_deref(),
+                        &shared.server_addr,
+                        binding.remote_port,
+                    ),
+                }
+            })
+            .collect()
+    };
+
+    let public = display_bindings
+        .first()
+        .map(|binding| binding.public.clone())
+        .unwrap_or_else(|| {
+            public_endpoint(
+                shared.public_addr.as_deref(),
+                &shared.server_addr,
+                remote_port,
+            )
+        });
     if let Some(s) = shared.status.get(&name) {
         *s.public_addr.lock().unwrap() = Some(public.clone());
+        *s.bindings.lock().unwrap() = display_bindings;
         *s.error.lock().unwrap() = None;
         s.up.store(true, Relaxed);
         if proto.has_udp() && !encrypted {
@@ -519,10 +685,13 @@ fn apply_accepted(shared: &Arc<ClientShared>, conn_cancel: &CancellationToken, m
     tracing::info!("tunnel '{name}' ({proto}) is live at {public}");
 
     if proto.has_udp() {
-        if let Some(token) = token {
+        for binding in accepted_bindings {
+            let Some(token) = binding.token else {
+                continue;
+            };
             let (local, udp_source_pool, counters, diagnostics) = match shared.status.get(&name) {
                 Some(s) => (
-                    s.local_addr,
+                    local_addr_for_port(s.local_addr, binding.local_port),
                     s.udp_source_pool,
                     s.counters.clone(),
                     s.diagnostics.clone(),
@@ -532,7 +701,7 @@ fn apply_accepted(shared: &Arc<ClientShared>, conn_cancel: &CancellationToken, m
             if encrypted {
                 tokio::spawn(udp::client_channel(
                     shared.clone(),
-                    name,
+                    name.clone(),
                     local,
                     udp_source_pool,
                     token,
@@ -540,30 +709,30 @@ fn apply_accepted(shared: &Arc<ClientShared>, conn_cancel: &CancellationToken, m
                     conn_cancel.clone(),
                 ));
             } else {
-                let Some(key_text) = udp_auth_key else {
+                let Some(key_text) = binding.udp_auth_key else {
                     tracing::warn!("udp tunnel '{name}' missing plaintext auth key");
-                    return;
+                    continue;
                 };
                 let key = match protocol::decode_udp_auth_key(&key_text) {
                     Ok(k) => k,
                     Err(e) => {
                         tracing::warn!("udp tunnel '{name}' has invalid plaintext auth key: {e:#}");
-                        return;
+                        continue;
                     }
                 };
                 let server_udp = public_endpoint(
                     shared.public_addr.as_deref(),
                     &shared.server_addr,
-                    remote_port,
+                    binding.remote_port,
                 );
                 tokio::spawn(udp::client_plain_channel(
-                    name,
+                    name.clone(),
                     local,
                     server_udp,
                     udp::PlainUdpSettings {
                         token,
                         key,
-                        udp_mtu: udp_mtu.unwrap_or(protocol::DEFAULT_UDP_MTU),
+                        udp_mtu: binding.udp_mtu.unwrap_or(protocol::DEFAULT_UDP_MTU),
                         source_pool: udp_source_pool,
                     },
                     counters,
@@ -572,6 +741,14 @@ fn apply_accepted(shared: &Arc<ClientShared>, conn_cancel: &CancellationToken, m
                 ));
             }
         }
+    }
+}
+
+fn local_addr_for_port(base: SocketAddr, local_port: u16) -> SocketAddr {
+    if local_port == 0 || local_port == base.port() {
+        base
+    } else {
+        SocketAddr::new(base.ip(), local_port)
     }
 }
 
@@ -649,13 +826,19 @@ async fn command_processor(shared: Arc<ClientShared>, mut cmd_rx: mpsc::Receiver
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             Command::Add(t) => {
-                ensure_status(&shared, &t);
-                {
+                let replacing = {
                     let mut f = shared.file.lock().unwrap();
+                    let replacing = f.tunnels.iter().any(|x| x.name == t.name);
                     f.tunnels.retain(|x| x.name != t.name);
                     f.tunnels.push(t.clone());
                     persist(&shared, &f);
+                    replacing
+                };
+                if replacing {
+                    mark_tunnel_down(&shared, &t.name);
+                    unregister_tunnel(&shared, &t.name).await;
                 }
+                ensure_status(&shared, &t);
                 if effective_enabled(&shared, &t) {
                     register_tunnel(&shared, &t).await;
                 }
@@ -737,6 +920,7 @@ async fn register_tunnel(shared: &Arc<ClientShared>, t: &TunnelConfig) {
             name: t.name.clone(),
             proto: t.protocol,
             remote_port: t.remote_port,
+            local_ports: config::tunnel_local_ports_spec(t).ok(),
             encrypted: t.encrypted,
             udp_mtu: t.udp_mtu,
         },
@@ -757,6 +941,10 @@ async fn unregister_tunnel(shared: &Arc<ClientShared>, name: &str) {
 fn mark_tunnel_down(shared: &ClientShared, name: &str) {
     if let Some(s) = shared.status.get(name) {
         s.up.store(false, Relaxed);
+        *s.public_addr.lock().unwrap() = None;
+        s.bindings.lock().unwrap().clear();
+        s.rate_in_bps.store(0, Relaxed);
+        s.rate_out_bps.store(0, Relaxed);
     }
 }
 
@@ -845,6 +1033,7 @@ mod tests {
             connected: AtomicBool::new(false),
             min_port: AtomicU16::new(0),
             max_port: AtomicU16::new(0),
+            metrics: Mutex::new(MetricsHistory::default()),
             started: Instant::now(),
             shutdown: CancellationToken::new(),
         })
@@ -871,6 +1060,7 @@ mod tests {
             protocol: Proto::Tcp,
             local_addr: "127.0.0.1:25565".parse().unwrap(),
             remote_port: Some(25565),
+            local_ports: None,
             enabled: true,
             encrypted: false,
             udp_mtu: None,
@@ -943,6 +1133,7 @@ mod tests {
             protocol: Proto::Both,
             local_addr: "127.0.0.1:25565".parse().unwrap(),
             remote_port: Some(25565),
+            local_ports: None,
             enabled: true,
             encrypted: true,
             udp_mtu: Some(900),
@@ -966,6 +1157,7 @@ mod tests {
                 name: "both".into(),
                 proto: Proto::Both,
                 remote_port: Some(25565),
+                local_ports: Some("25565".into()),
                 encrypted: true,
                 udp_mtu: Some(900),
             }
@@ -984,6 +1176,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_command_replaces_existing_tunnel_by_unregistering_first() {
+        let existing = TunnelConfig {
+            name: "edit".into(),
+            protocol: Proto::Tcp,
+            local_addr: "127.0.0.1:1000".parse().unwrap(),
+            remote_port: Some(2000),
+            local_ports: None,
+            enabled: true,
+            encrypted: false,
+            udp_mtu: None,
+            udp_source_pool: None,
+            proxy_protocol: ProxyProtocol::Off,
+        };
+        let updated = TunnelConfig {
+            name: "edit".into(),
+            protocol: Proto::Tcp,
+            local_addr: "127.0.0.1:1001".parse().unwrap(),
+            remote_port: Some(2001),
+            local_ports: None,
+            enabled: true,
+            encrypted: false,
+            udp_mtu: None,
+            udp_source_pool: None,
+            proxy_protocol: ProxyProtocol::Off,
+        };
+        let file = ClientFile {
+            tunnels: vec![existing],
+            ..Default::default()
+        };
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let shared = test_shared(file, None, Some(out_tx));
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let processor = tokio::spawn(command_processor(shared, cmd_rx));
+
+        cmd_tx.send(Command::Add(updated)).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            ClientMessage::Unregister {
+                name: "edit".into()
+            }
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            ClientMessage::Register {
+                name: "edit".into(),
+                proto: Proto::Tcp,
+                remote_port: Some(2001),
+                local_ports: Some("1001".into()),
+                encrypted: false,
+                udp_mtu: None,
+            }
+        );
+
+        drop(cmd_tx);
+        tokio::time::timeout(Duration::from_secs(1), processor)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn pause_commands_persist_and_update_control_writer_without_network() {
         let path = temp_client_path("pause");
         let enabled = TunnelConfig {
@@ -991,6 +1250,7 @@ mod tests {
             protocol: Proto::Tcp,
             local_addr: "127.0.0.1:25565".parse().unwrap(),
             remote_port: Some(25565),
+            local_ports: None,
             enabled: true,
             encrypted: false,
             udp_mtu: None,
@@ -1002,6 +1262,7 @@ mod tests {
             protocol: Proto::Tcp,
             local_addr: "127.0.0.1:25566".parse().unwrap(),
             remote_port: Some(25566),
+            local_ports: None,
             enabled: false,
             encrypted: false,
             udp_mtu: None,
@@ -1044,6 +1305,7 @@ mod tests {
                 name: "enabled".into(),
                 proto: Proto::Tcp,
                 remote_port: Some(25565),
+                local_ports: Some("25565".into()),
                 encrypted: false,
                 udp_mtu: None
             }

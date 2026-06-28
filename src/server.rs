@@ -56,6 +56,28 @@ struct Session {
     udp_tokens: Vec<Uuid>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BindingRequest {
+    local_port: u16,
+    remote_port: u16,
+}
+
+struct BoundBinding {
+    request: BindingRequest,
+    cancel: CancellationToken,
+    tcp: Option<TcpListener>,
+    udp: Option<Arc<UdpSocket>>,
+}
+
+struct RegisterRequest {
+    name: String,
+    proto: Proto,
+    remote_port: Option<u16>,
+    local_ports: Option<String>,
+    encrypted: bool,
+    udp_mtu: Option<u16>,
+}
+
 #[derive(Clone)]
 struct Server {
     settings: Arc<ServerSettings>,
@@ -330,11 +352,22 @@ impl Server {
                         name,
                         proto,
                         remote_port,
+                        local_ports,
                         encrypted,
                         udp_mtu,
                     }) => {
-                        self.register(&mut session, name, proto, remote_port, encrypted, udp_mtu)
-                            .await;
+                        self.register(
+                            &mut session,
+                            RegisterRequest {
+                                name,
+                                proto,
+                                remote_port,
+                                local_ports,
+                                encrypted,
+                                udp_mtu,
+                            },
+                        )
+                        .await;
                     }
                     Ok(ClientMessage::Unregister { name }) => self.unregister(&mut session, &name),
                     Ok(ClientMessage::Heartbeat) => {}
@@ -352,15 +385,15 @@ impl Server {
         outcome
     }
 
-    async fn register(
-        &self,
-        session: &mut Session,
-        name: String,
-        proto: Proto,
-        remote_port: Option<u16>,
-        encrypted: bool,
-        udp_mtu: Option<u16>,
-    ) {
+    async fn register(&self, session: &mut Session, request: RegisterRequest) {
+        let RegisterRequest {
+            name,
+            proto,
+            remote_port,
+            local_ports,
+            encrypted,
+            udp_mtu,
+        } = request;
         let tx = session.control_tx.clone();
         if let Err(e) = config::validate_udp_mtu(proto, udp_mtu) {
             let _ = tx
@@ -373,215 +406,334 @@ impl Server {
         }
         let resolved_udp_mtu = config::resolved_udp_mtu(proto, udp_mtu);
 
-        let candidates: Vec<u16> = match remote_port {
-            Some(p) => {
-                if !self.settings.port_allowed(p) {
+        let (local_ports, contiguous) = match local_ports.as_deref() {
+            Some(spec) => match config::parse_local_ports(spec) {
+                Ok(selection) => (selection.ports(), selection.is_range()),
+                Err(e) => {
                     let _ = tx
                         .send(ServerMessage::Rejected {
                             name,
-                            reason: format!(
-                                "port {p} is outside the allowed range {}-{}",
-                                self.settings.min_port, self.settings.max_port
-                            ),
+                            reason: e.to_string(),
                         })
                         .await;
                     return;
                 }
-                vec![p]
-            }
-            None => (self.settings.min_port..=self.settings.max_port).collect(),
+            },
+            None => (vec![0], false),
         };
 
-        for port in candidates {
-            let cancel = session.cancel.child_token();
+        let requests = match self.allocate_requests(&local_ports, contiguous, remote_port) {
+            Ok(requests) => requests,
+            Err(reason) => {
+                let _ = tx.send(ServerMessage::Rejected { name, reason }).await;
+                return;
+            }
+        };
+
+        let bound = match self.try_bind_requests(session, &name, proto, &requests) {
+            Ok(bound) => bound,
+            Err(reason) => {
+                let _ = tx.send(ServerMessage::Rejected { name, reason }).await;
+                return;
+            }
+        };
+
+        let mut bindings = Vec::with_capacity(bound.len());
+        for binding in bound {
+            let BindingRequest {
+                local_port,
+                remote_port,
+            } = binding.request;
+            let public_addr = format!("{}:{}", self.settings.bind_addr, remote_port);
+            let mut token = None;
+            let mut udp_auth_key = None;
+
+            if let Some(socket) = binding.udp {
+                let udp_token = Uuid::new_v4();
+                token = Some(udp_token);
+                if encrypted {
+                    self.udp_pending.insert(
+                        udp_token,
+                        PendingUdp {
+                            socket,
+                            port: remote_port,
+                            session: session.id,
+                            cancel: binding.cancel.clone(),
+                        },
+                    );
+                    session.udp_tokens.push(udp_token);
+                } else {
+                    let mut key = [0u8; 32];
+                    rand::thread_rng().fill_bytes(&mut key);
+                    tokio::spawn(udp::server_plain_forward(
+                        socket,
+                        udp_token,
+                        key,
+                        resolved_udp_mtu.unwrap_or(protocol::DEFAULT_UDP_MTU),
+                        binding.cancel.clone(),
+                    ));
+                    udp_auth_key = Some(protocol::encode_udp_auth_key(&key));
+                }
+            }
+
+            if let Some(listener) = binding.tcp {
+                tokio::spawn(tcp::server_listener(
+                    listener,
+                    name.clone(),
+                    local_port,
+                    encrypted,
+                    tx.clone(),
+                    self.pending.clone(),
+                    binding.cancel.clone(),
+                ));
+            }
+
+            session.ports.push(remote_port);
+            tracing::info!("tunnel '{name}' ({proto}) maps local port {local_port} -> public port {remote_port}");
+            bindings.push(protocol::AcceptedBinding {
+                local_port,
+                remote_port,
+                public_addr,
+                token,
+                udp_auth_key,
+                udp_mtu: resolved_udp_mtu,
+            });
+        }
+
+        let Some(first) = bindings.first().cloned() else {
+            let _ = tx
+                .send(ServerMessage::Rejected {
+                    name,
+                    reason: "no public ports requested".into(),
+                })
+                .await;
+            return;
+        };
+        let _ = tx
+            .send(ServerMessage::Accepted {
+                name,
+                proto,
+                public_addr: first.public_addr.clone(),
+                remote_port: first.remote_port,
+                encrypted,
+                token: first.token,
+                udp_auth_key: first.udp_auth_key.clone(),
+                udp_mtu: resolved_udp_mtu,
+                bindings,
+            })
+            .await;
+    }
+
+    fn allocate_requests(
+        &self,
+        local_ports: &[u16],
+        contiguous: bool,
+        remote_port: Option<u16>,
+    ) -> std::result::Result<Vec<BindingRequest>, String> {
+        if local_ports.is_empty() {
+            return Err("no local ports requested".into());
+        }
+        if local_ports.len() > config::MAX_TUNNEL_PORTS {
+            return Err(format!(
+                "a tunnel can reserve at most {} ports",
+                config::MAX_TUNNEL_PORTS
+            ));
+        }
+
+        let remote_ports = if contiguous && local_ports.len() > 1 {
+            self.allocate_contiguous_public_ports(local_ports.len(), remote_port)?
+        } else {
+            self.allocate_sparse_public_ports(local_ports.len(), remote_port)?
+        };
+        Ok(local_ports
+            .iter()
+            .copied()
+            .zip(remote_ports)
+            .map(|(local_port, remote_port)| BindingRequest {
+                local_port,
+                remote_port,
+            })
+            .collect())
+    }
+
+    fn allocate_contiguous_public_ports(
+        &self,
+        count: usize,
+        remote_port: Option<u16>,
+    ) -> std::result::Result<Vec<u16>, String> {
+        let count = u16::try_from(count).map_err(|_| "requested port block is too large")?;
+        let max_start = self
+            .settings
+            .max_port
+            .checked_sub(count.saturating_sub(1))
+            .ok_or_else(|| "requested port block is larger than the relay range".to_string())?;
+
+        if let Some(start) = remote_port {
+            let end_u32 = u32::from(start) + u32::from(count) - 1;
+            if end_u32 > u32::from(u16::MAX) {
+                return Err(format!(
+                    "public port block starting at {start} is too large"
+                ));
+            }
+            let end = end_u32 as u16;
+            if start < self.settings.min_port || end > self.settings.max_port {
+                return Err(format!(
+                    "public port block {start}-{end} is outside the allowed range {}-{}",
+                    self.settings.min_port, self.settings.max_port
+                ));
+            }
+            let ports: Vec<u16> = (start..=end).collect();
+            if let Some(occupied) = ports.iter().find(|port| self.tunnels.contains_key(port)) {
+                return Err(format!(
+                    "public port block {start}-{end} is fragmented at {occupied}"
+                ));
+            }
+            return Ok(ports);
+        }
+
+        for start in self.settings.min_port..=max_start {
+            let end = start + count - 1;
+            let ports: Vec<u16> = (start..=end).collect();
+            if ports.iter().all(|port| !self.tunnels.contains_key(port)) {
+                return Ok(ports);
+            }
+        }
+        Err(format!(
+            "no contiguous public block of {count} ports is available in {}-{}",
+            self.settings.min_port, self.settings.max_port
+        ))
+    }
+
+    fn allocate_sparse_public_ports(
+        &self,
+        count: usize,
+        remote_port: Option<u16>,
+    ) -> std::result::Result<Vec<u16>, String> {
+        let mut ports = Vec::with_capacity(count);
+        let mut cursor = self.settings.min_port;
+        if let Some(first) = remote_port {
+            if !self.settings.port_allowed(first) {
+                return Err(format!(
+                    "port {first} is outside the allowed range {}-{}",
+                    self.settings.min_port, self.settings.max_port
+                ));
+            }
+            if self.tunnels.contains_key(&first) {
+                return Err(format!(
+                    "requested public port {first} is already allocated"
+                ));
+            }
+            ports.push(first);
+            cursor = first.saturating_add(1);
+        }
+
+        while ports.len() < count && cursor <= self.settings.max_port {
+            if !self.tunnels.contains_key(&cursor) && !ports.contains(&cursor) {
+                ports.push(cursor);
+            }
+            if cursor == u16::MAX {
+                break;
+            }
+            cursor += 1;
+        }
+
+        if ports.len() == count {
+            Ok(ports)
+        } else {
+            Err(format!(
+                "only {} free public ports are available after allocation constraints; {count} required",
+                ports.len()
+            ))
+        }
+    }
+
+    fn try_bind_requests(
+        &self,
+        session: &Session,
+        name: &str,
+        proto: Proto,
+        requests: &[BindingRequest],
+    ) -> std::result::Result<Vec<BoundBinding>, String> {
+        let cancel = session.cancel.child_token();
+        let mut reserved = Vec::with_capacity(requests.len());
+        for request in requests {
             let handle = TunnelHandle {
-                name: name.clone(),
+                name: name.to_string(),
                 session: session.id,
                 cancel: cancel.clone(),
             };
-            // Reserve the port atomically (drop the entry guard before any await).
-            match self.tunnels.entry(port) {
-                Entry::Occupied(_) => continue,
+            match self.tunnels.entry(request.remote_port) {
+                Entry::Occupied(_) => {
+                    self.release_reserved(&reserved);
+                    cancel.cancel();
+                    return Err(format!(
+                        "requested public port {} became allocated while registering",
+                        request.remote_port
+                    ));
+                }
                 Entry::Vacant(v) => {
                     v.insert(handle);
-                }
-            }
-
-            let addr: SocketAddr = match format!("{}:{}", self.settings.bind_addr, port).parse() {
-                Ok(a) => a,
-                Err(_) => {
-                    self.tunnels.remove(&port);
-                    continue;
-                }
-            };
-            let public_addr = format!("{}:{}", self.settings.bind_addr, port);
-
-            match proto {
-                Proto::Tcp => match net::bind_tcp(addr) {
-                    Ok(listener) => {
-                        tokio::spawn(tcp::server_listener(
-                            listener,
-                            name.clone(),
-                            encrypted,
-                            tx.clone(),
-                            self.pending.clone(),
-                            cancel,
-                        ));
-                        session.ports.push(port);
-                        tracing::info!("tunnel '{name}' (tcp) -> public port {port}");
-                        let _ = tx
-                            .send(ServerMessage::Accepted {
-                                name,
-                                proto,
-                                public_addr,
-                                remote_port: port,
-                                encrypted,
-                                token: None,
-                                udp_auth_key: None,
-                                udp_mtu: None,
-                            })
-                            .await;
-                        return;
-                    }
-                    Err(e) => {
-                        self.tunnels.remove(&port);
-                        tracing::debug!("bind tcp {addr}: {e}");
-                        continue;
-                    }
-                },
-                Proto::Udp => match net::bind_udp(addr) {
-                    Ok(socket) => {
-                        let token = Uuid::new_v4();
-                        let socket = Arc::new(socket);
-                        let udp_auth_key = if encrypted {
-                            self.udp_pending.insert(
-                                token,
-                                PendingUdp {
-                                    socket: socket.clone(),
-                                    port,
-                                    session: session.id,
-                                    cancel,
-                                },
-                            );
-                            None
-                        } else {
-                            let mut key = [0u8; 32];
-                            rand::thread_rng().fill_bytes(&mut key);
-                            tokio::spawn(udp::server_plain_forward(
-                                socket.clone(),
-                                token,
-                                key,
-                                resolved_udp_mtu.unwrap_or(protocol::DEFAULT_UDP_MTU),
-                                cancel,
-                            ));
-                            Some(protocol::encode_udp_auth_key(&key))
-                        };
-                        session.ports.push(port);
-                        if encrypted {
-                            session.udp_tokens.push(token);
-                        }
-                        tracing::info!("tunnel '{name}' (udp) -> public port {port}");
-                        let _ = tx
-                            .send(ServerMessage::Accepted {
-                                name,
-                                proto,
-                                public_addr,
-                                remote_port: port,
-                                encrypted,
-                                token: Some(token),
-                                udp_auth_key,
-                                udp_mtu: resolved_udp_mtu,
-                            })
-                            .await;
-                        return;
-                    }
-                    Err(e) => {
-                        self.tunnels.remove(&port);
-                        tracing::debug!("bind udp {addr}: {e}");
-                        continue;
-                    }
-                },
-                Proto::Both => {
-                    let listener = match net::bind_tcp(addr) {
-                        Ok(listener) => listener,
-                        Err(e) => {
-                            self.tunnels.remove(&port);
-                            cancel.cancel();
-                            tracing::debug!("bind tcp {addr}: {e}");
-                            continue;
-                        }
-                    };
-                    let socket = match net::bind_udp(addr) {
-                        Ok(socket) => Arc::new(socket),
-                        Err(e) => {
-                            self.tunnels.remove(&port);
-                            cancel.cancel();
-                            tracing::debug!("bind udp {addr}: {e}");
-                            continue;
-                        }
-                    };
-
-                    let token = Uuid::new_v4();
-                    let udp_auth_key = if encrypted {
-                        self.udp_pending.insert(
-                            token,
-                            PendingUdp {
-                                socket: socket.clone(),
-                                port,
-                                session: session.id,
-                                cancel: cancel.clone(),
-                            },
-                        );
-                        None
-                    } else {
-                        let mut key = [0u8; 32];
-                        rand::thread_rng().fill_bytes(&mut key);
-                        tokio::spawn(udp::server_plain_forward(
-                            socket.clone(),
-                            token,
-                            key,
-                            resolved_udp_mtu.unwrap_or(protocol::DEFAULT_UDP_MTU),
-                            cancel.clone(),
-                        ));
-                        Some(protocol::encode_udp_auth_key(&key))
-                    };
-
-                    tokio::spawn(tcp::server_listener(
-                        listener,
-                        name.clone(),
-                        encrypted,
-                        tx.clone(),
-                        self.pending.clone(),
-                        cancel.clone(),
-                    ));
-                    session.ports.push(port);
-                    if encrypted {
-                        session.udp_tokens.push(token);
-                    }
-                    tracing::info!("tunnel '{name}' (both) -> public port {port}");
-                    let _ = tx
-                        .send(ServerMessage::Accepted {
-                            name,
-                            proto,
-                            public_addr,
-                            remote_port: port,
-                            encrypted,
-                            token: Some(token),
-                            udp_auth_key,
-                            udp_mtu: resolved_udp_mtu,
-                        })
-                        .await;
-                    return;
+                    reserved.push(request.remote_port);
                 }
             }
         }
 
-        let _ = tx
-            .send(ServerMessage::Rejected {
-                name: name.clone(),
-                reason: format!("no public port available for tunnel '{name}'"),
-            })
-            .await;
+        let mut bound = Vec::with_capacity(requests.len());
+        for request in requests {
+            let addr: SocketAddr =
+                match format!("{}:{}", self.settings.bind_addr, request.remote_port).parse() {
+                    Ok(addr) => addr,
+                    Err(_) => {
+                        self.release_reserved(&reserved);
+                        cancel.cancel();
+                        return Err(format!(
+                            "invalid bind address for public port {}",
+                            request.remote_port
+                        ));
+                    }
+                };
+            let mut tcp = None;
+            let mut udp = None;
+            if proto.has_tcp() {
+                match net::bind_tcp(addr) {
+                    Ok(listener) => tcp = Some(listener),
+                    Err(e) => {
+                        self.release_reserved(&reserved);
+                        cancel.cancel();
+                        return Err(format!(
+                            "binding tcp public port {} failed: {e}",
+                            request.remote_port
+                        ));
+                    }
+                }
+            }
+            if proto.has_udp() {
+                match net::bind_udp(addr) {
+                    Ok(socket) => udp = Some(Arc::new(socket)),
+                    Err(e) => {
+                        self.release_reserved(&reserved);
+                        cancel.cancel();
+                        return Err(format!(
+                            "binding udp public port {} failed: {e}",
+                            request.remote_port
+                        ));
+                    }
+                }
+            }
+            bound.push(BoundBinding {
+                request: *request,
+                cancel: cancel.clone(),
+                tcp,
+                udp,
+            });
+        }
+        Ok(bound)
+    }
+
+    fn release_reserved(&self, ports: &[u16]) {
+        for port in ports {
+            self.tunnels.remove(port);
+        }
     }
 
     fn unregister(&self, session: &mut Session, name: &str) {
@@ -746,4 +898,131 @@ fn prompt_default(question: &str, default: &str) -> String {
         }
     }
     default.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_paths(tag: &str) -> (PathBuf, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("porthole-server-unit-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("c.crt");
+        let key = dir.join("c.key");
+        let _ = std::fs::remove_file(&cert);
+        let _ = std::fs::remove_file(&key);
+        (cert, key)
+    }
+
+    fn test_server(tag: &str, min_port: u16, max_port: u16) -> Server {
+        let _ = crate::install_crypto_provider();
+        let (cert, key) = temp_paths(tag);
+        let settings = ServerSettings {
+            bind_addr: "127.0.0.1".into(),
+            control_port: 7835,
+            secret: "test-secret".into(),
+            min_port,
+            max_port,
+            cert_path: cert,
+            key_path: key,
+            public_host: None,
+        };
+        let (acceptor, _) = tls::server_acceptor(&settings).unwrap();
+        Server {
+            settings: Arc::new(settings),
+            acceptor,
+            pending: Arc::new(DashMap::new()),
+            tunnels: Arc::new(DashMap::new()),
+            udp_pending: Arc::new(DashMap::new()),
+        }
+    }
+
+    fn occupy(server: &Server, port: u16) {
+        server.tunnels.insert(
+            port,
+            TunnelHandle {
+                name: "occupied".into(),
+                session: Uuid::nil(),
+                cancel: CancellationToken::new(),
+            },
+        );
+    }
+
+    #[test]
+    fn contiguous_auto_allocation_skips_fragmented_prefix() {
+        let server = test_server("contiguous-auto", 10000, 10010);
+        occupy(&server, 10001);
+
+        let requests = server
+            .allocate_requests(&[4000, 4001, 4002], true, None)
+            .unwrap();
+        let remote: Vec<u16> = requests.iter().map(|r| r.remote_port).collect();
+        assert_eq!(remote, vec![10002, 10003, 10004]);
+    }
+
+    #[test]
+    fn fixed_contiguous_allocation_rejects_fragmentation() {
+        let server = test_server("contiguous-fixed", 10000, 10010);
+        occupy(&server, 10003);
+
+        let err = server
+            .allocate_requests(&[4000, 4001, 4002, 4003], true, Some(10000))
+            .unwrap_err();
+        assert!(err.contains("fragmented at 10003"));
+    }
+
+    #[test]
+    fn sparse_allocation_uses_first_n_free_ports() {
+        let server = test_server("sparse-auto", 10000, 10005);
+        occupy(&server, 10000);
+
+        let requests = server
+            .allocate_requests(&[1000, 2000], false, None)
+            .unwrap();
+        let remote: Vec<u16> = requests.iter().map(|r| r.remote_port).collect();
+        assert_eq!(remote, vec![10001, 10002]);
+    }
+
+    #[test]
+    fn sparse_fixed_start_keeps_first_port_and_skips_next_occupied() {
+        let server = test_server("sparse-fixed", 10000, 10005);
+        occupy(&server, 10003);
+
+        let requests = server
+            .allocate_requests(&[1000, 2000], false, Some(10002))
+            .unwrap();
+        let remote: Vec<u16> = requests.iter().map(|r| r.remote_port).collect();
+        assert_eq!(remote, vec![10002, 10004]);
+    }
+
+    #[test]
+    fn bind_failure_rolls_back_reserved_ports() {
+        let mut server = test_server("bind-rollback", 10000, 10001);
+        Arc::get_mut(&mut server.settings).unwrap().bind_addr = "not an address".into();
+        let session = Session {
+            id: Uuid::new_v4(),
+            cancel: CancellationToken::new(),
+            control_tx: mpsc::channel(1).0,
+            ports: Vec::new(),
+            udp_tokens: Vec::new(),
+        };
+        let requests = vec![
+            BindingRequest {
+                local_port: 4000,
+                remote_port: 10000,
+            },
+            BindingRequest {
+                local_port: 4001,
+                remote_port: 10001,
+            },
+        ];
+
+        assert!(server
+            .try_bind_requests(&session, "bad", Proto::Tcp, &requests)
+            .is_err());
+        assert!(!server.tunnels.contains_key(&10000));
+        assert!(!server.tunnels.contains_key(&10001));
+    }
 }

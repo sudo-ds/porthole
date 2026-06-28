@@ -120,9 +120,10 @@ On an interactive terminal the client shows a live dashboard:
   tunnel 'minecraft' (tcp) is live at 10xdev.sk:25565
 ```
 
-The web UI at `http://127.0.0.1:4040` shows the same and lets you add/remove/toggle tunnels.
-It can also pause all tunnels at once. Pause is a persisted global hold: individual tunnel
-`enabled` values stay unchanged, and unpause restores only the tunnels that were enabled.
+The web UI at `http://127.0.0.1:4040` shows the same, live bandwidth/latency history, and lets
+you add/edit/remove/toggle tunnels. It can also pause all tunnels at once. Pause is a persisted
+global hold: individual tunnel `enabled` values stay unchanged, and unpause restores only the
+tunnels that were enabled.
 Use `--no-banner` for plain log output (e.g. under a service manager).
 
 ## Configuration & CLI
@@ -204,6 +205,13 @@ PORTHOLE_SECRET=... porthole client \
 (use REMOTE `0` for a server-assigned port). The `encrypted` key also accepts `encrypt` or `tls` as aliases.
 `proto` is `tcp`, `udp`, or `both`. For UDP-capable tunnels, `udp_mtu` also accepts `mtu`;
 it defaults to `1200` and must be between `256` and `65507`.
+
+`LOCAL` may also select multiple local ports. Ranges are inclusive:
+`games=udp:127.0.0.1:4000-6000->0` asks the relay to reserve the first contiguous public block
+with the same number of ports. Sparse lists are also supported:
+`admin=tcp:127.0.0.1:1000,2000->0` maps those local ports to the first free public ports. If
+REMOTE is non-zero, it is treated as the fixed public start for a range, or the fixed first
+public port for a sparse list. A logical tunnel may reserve up to 2048 public ports.
 
 ### TCP source IP forwarding
 
