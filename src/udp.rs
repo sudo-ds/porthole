@@ -499,16 +499,16 @@ async fn run_udp_channel(
                                 last_seen: last_seen.clone(),
                             },
                         );
-                        tokio::spawn(flow_reader(
+                        tokio::spawn(flow_reader(FlowReader {
                             src,
-                            sock.clone(),
-                            out_tx.clone(),
+                            sock: sock.clone(),
+                            out_tx: out_tx.clone(),
                             last_seen,
-                            counters.clone(),
-                            None,
-                            flow_cancel,
+                            counters: counters.clone(),
+                            diagnostics: None,
+                            cancel: flow_cancel,
                             started,
-                        ));
+                        }));
                         sock
                     }
                 };
@@ -545,7 +545,6 @@ async fn run_plain_udp_channel(
         let channel = channel.clone();
         let writer_cancel = link.clone();
         let seq = seq.clone();
-        let started = started;
         tokio::spawn(async move {
             let _ = send_plain_udp_packet(
                 &channel,
@@ -689,16 +688,16 @@ async fn run_plain_udp_channel(
                                 last_seen: last_seen.clone(),
                             },
                         );
-                        tokio::spawn(flow_reader(
+                        tokio::spawn(flow_reader(FlowReader {
                             src,
-                            sock.clone(),
-                            out_tx.clone(),
+                            sock: sock.clone(),
+                            out_tx: out_tx.clone(),
                             last_seen,
-                            counters.clone(),
-                            Some(diagnostics.clone()),
-                            flow_cancel,
+                            counters: counters.clone(),
+                            diagnostics: Some(diagnostics.clone()),
+                            cancel: flow_cancel,
                             started,
-                        ));
+                        }));
                         sock
                     }
                 };
@@ -716,7 +715,7 @@ async fn run_plain_udp_channel(
 }
 
 /// Per-flow task: read replies from the local service and queue them back to the server.
-async fn flow_reader(
+struct FlowReader {
     src: SocketAddr,
     sock: Arc<UdpSocket>,
     out_tx: mpsc::Sender<Bytes>,
@@ -725,19 +724,21 @@ async fn flow_reader(
     diagnostics: Option<Arc<PlainUdpDiagnostics>>,
     cancel: CancellationToken,
     started: Instant,
-) {
+}
+
+async fn flow_reader(ctx: FlowReader) {
     let mut buf = vec![0u8; MAX_DATAGRAM];
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => break,
-            r = sock.recv(&mut buf) => match r {
+            _ = ctx.cancel.cancelled() => break,
+            r = ctx.sock.recv(&mut buf) => match r {
                 Ok(n) => {
-                    last_seen.store(epoch_ms(&started), Relaxed);
-                    counters.bytes_out.fetch_add(n as u64, Relaxed);
+                    ctx.last_seen.store(epoch_ms(&ctx.started), Relaxed);
+                    ctx.counters.bytes_out.fetch_add(n as u64, Relaxed);
                     let overhead = Instant::now();
                     // try_send: if the link is backed up, drop rather than block or buffer.
-                    if out_tx.try_send(encode_udp(src, &buf[..n])).is_ok() {
-                        if let Some(diagnostics) = &diagnostics {
+                    if ctx.out_tx.try_send(encode_udp(ctx.src, &buf[..n])).is_ok() {
+                        if let Some(diagnostics) = &ctx.diagnostics {
                             diagnostics.client_local_to_server.record(overhead.elapsed());
                         }
                     }
