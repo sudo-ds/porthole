@@ -29,6 +29,18 @@ impl LatencyStats {
         update_max(&self.max_us, us);
     }
 
+    pub fn record_batch(&self, batch: &mut LatencyBatch) {
+        if batch.samples == 0 {
+            return;
+        }
+        self.samples.fetch_add(batch.samples, Relaxed);
+        self.total_us.fetch_add(batch.total_us, Relaxed);
+        self.last_us.store(batch.last_us, Relaxed);
+        update_min(&self.min_us, batch.min_us);
+        update_max(&self.max_us, batch.max_us);
+        batch.reset();
+    }
+
     pub fn snapshot(&self) -> Option<LatencySnapshot> {
         let samples = self.samples.load(Relaxed);
         if samples == 0 {
@@ -49,6 +61,34 @@ impl LatencyStats {
         self.last_us.store(0, Relaxed);
         self.min_us.store(0, Relaxed);
         self.max_us.store(0, Relaxed);
+    }
+}
+
+#[derive(Default)]
+pub struct LatencyBatch {
+    samples: u64,
+    total_us: u64,
+    last_us: u64,
+    min_us: u64,
+    max_us: u64,
+}
+
+impl LatencyBatch {
+    pub fn record(&mut self, elapsed: Duration) {
+        let us = duration_us(elapsed);
+        self.samples = self.samples.saturating_add(1);
+        self.total_us = self.total_us.saturating_add(us);
+        self.last_us = us;
+        if self.min_us == 0 || us < self.min_us {
+            self.min_us = us;
+        }
+        if us > self.max_us {
+            self.max_us = us;
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -153,6 +193,24 @@ mod tests {
 
         stats.record(Duration::from_micros(10));
         stats.record(Duration::from_micros(30));
+
+        let snap = stats.snapshot().unwrap();
+        assert_eq!(snap.samples, 2);
+        assert_eq!(snap.last_us, 30);
+        assert_eq!(snap.avg_us, 20);
+        assert_eq!(snap.min_us, 10);
+        assert_eq!(snap.max_us, 30);
+    }
+
+    #[test]
+    fn latency_stats_flushes_batch() {
+        let stats = LatencyStats::default();
+        let mut batch = LatencyBatch::default();
+        batch.record(Duration::from_micros(10));
+        batch.record(Duration::from_micros(30));
+
+        stats.record_batch(&mut batch);
+        stats.record_batch(&mut batch);
 
         let snap = stats.snapshot().unwrap();
         assert_eq!(snap.samples, 2);

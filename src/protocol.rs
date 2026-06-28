@@ -472,6 +472,16 @@ pub fn decode_plain_udp<'a>(
     Ok((kind, u64::from_be_bytes(seq_bytes), &packet[14..tag_start]))
 }
 
+pub(crate) fn peek_plain_udp_kind(packet: &[u8]) -> Option<PlainUdpKind> {
+    if packet.len() < UDP_PLAINTEXT_OVERHEAD {
+        return None;
+    }
+    if &packet[..4] != UDP_PLAINTEXT_MAGIC || packet[4] != UDP_PLAINTEXT_VERSION {
+        return None;
+    }
+    PlainUdpKind::from_code(packet[5]).ok()
+}
+
 // ---------------------------------------------------------------------------
 // Prefixed: hand a framed stream off to a raw byte splice without losing bytes
 // the codec already read past the last frame.
@@ -597,6 +607,20 @@ mod tests {
         let mut tampered = packet.to_vec();
         tampered[14] ^= 0x01;
         assert!(decode_plain_udp(&tampered, &key).is_err());
+    }
+
+    #[test]
+    fn plaintext_udp_kind_peek_does_not_authenticate() {
+        let key = [17u8; 32];
+        let packet = encode_plain_udp(PlainUdpKind::Hello, 42, b"hello", &key).unwrap();
+        assert_eq!(peek_plain_udp_kind(&packet), Some(PlainUdpKind::Hello));
+
+        let mut tampered = packet.to_vec();
+        tampered[14] ^= 0x01;
+        assert_eq!(peek_plain_udp_kind(&tampered), Some(PlainUdpKind::Hello));
+
+        tampered[0] = b'X';
+        assert_eq!(peek_plain_udp_kind(&tampered), None);
     }
 
     #[test]

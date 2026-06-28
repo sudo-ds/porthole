@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context, Result};
@@ -22,12 +22,13 @@ use uuid::Uuid;
 
 use crate::client::{ClientShared, Counters};
 use crate::config::UdpSourcePool;
-use crate::diagnostics::{LatencySnapshot, LatencyStats, PlainUdpDiagnostics};
+use crate::diagnostics::{LatencyBatch, LatencySnapshot, LatencyStats, PlainUdpDiagnostics};
 use crate::protocol::{
     decode_plain_udp, decode_udp, decode_udp_fragment_body, encode_plain_udp, encode_udp,
-    encode_udp_fragment_body, PlainUdpFragment, PlainUdpKind, Wire, UDP_DIAGNOSTICS_INTERVAL,
-    UDP_IDLE_TIMEOUT, UDP_PLAINTEXT_FRAGMENT_HEADER, UDP_PLAINTEXT_KEEPALIVE,
-    UDP_PLAINTEXT_MAX_ENCAPSULATED, UDP_PLAINTEXT_MAX_PACKET, UDP_PLAINTEXT_OVERHEAD,
+    encode_udp_fragment_body, peek_plain_udp_kind, PlainUdpFragment, PlainUdpKind, Wire,
+    UDP_DIAGNOSTICS_INTERVAL, UDP_IDLE_TIMEOUT, UDP_PLAINTEXT_FRAGMENT_HEADER,
+    UDP_PLAINTEXT_KEEPALIVE, UDP_PLAINTEXT_MAX_ENCAPSULATED, UDP_PLAINTEXT_MAX_PACKET,
+    UDP_PLAINTEXT_OVERHEAD,
 };
 use crate::server::ServerTls;
 
@@ -154,18 +155,38 @@ pub async fn server_plain_forward(
     udp_mtu: u16,
     cancel: CancellationToken,
 ) -> Result<()> {
+    server_plain_forward_io(socket, token, key, udp_mtu, cancel).await
+}
+
+async fn server_plain_forward_io<S>(
+    socket: Arc<S>,
+    token: Uuid,
+    key: [u8; 32],
+    udp_mtu: u16,
+    cancel: CancellationToken,
+) -> Result<()>
+where
+    S: UdpIo,
+{
     let mut buf = vec![0u8; MAX_DATAGRAM];
     let mut client: Option<SocketAddr> = None;
     let mut seq = 0u64;
     let mut reassembly = PlainUdpReassembler::new();
     let mut reassembly_janitor = tokio::time::interval(Duration::from_secs(1));
+    let mut diagnostics_flush = tokio::time::interval(UDP_DIAGNOSTICS_INTERVAL);
     let diagnostics = PlainUdpServerDiagnostics::default();
+    let mut public_to_client = LatencyBatch::default();
+    let mut client_to_public = LatencyBatch::default();
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = reassembly_janitor.tick() => {
                 reassembly.prune_expired(Instant::now());
+            }
+            _ = diagnostics_flush.tick() => {
+                diagnostics.public_to_client.record_batch(&mut public_to_client);
+                diagnostics.client_to_public.record_batch(&mut client_to_public);
             }
             r = socket.recv_from(&mut buf) => {
                 let (n, peer) = match r {
@@ -176,96 +197,102 @@ pub async fn server_plain_forward(
                     }
                 };
                 let packet = &buf[..n];
-                match decode_plain_udp(packet, &key) {
-                    Ok((PlainUdpKind::Hello, _, body)) => {
-                        if body == token.as_bytes() {
-                            client = Some(peer);
-                        }
-                    }
-                    Ok((PlainUdpKind::Keepalive, _, _)) => {
-                        if client != Some(peer) {
-                            tracing::trace!("ignored plaintext udp keepalive from unpinned endpoint {peer}");
-                        }
-                    }
-                    Ok((PlainUdpKind::Data, _, body)) => {
-                        if client != Some(peer) {
-                            tracing::trace!("ignored plaintext udp data from unpinned endpoint {peer}");
-                            continue;
-                        }
-                        let overhead = Instant::now();
-                        if let Ok((dst, data)) = decode_udp(body) {
-                            if socket.send_to(data, dst).await.is_ok() {
-                                diagnostics.client_to_public.record(overhead.elapsed());
+                if client == Some(peer) {
+                    match decode_plain_udp(packet, &key) {
+                        Ok((PlainUdpKind::Hello, _, body)) => {
+                            if body == token.as_bytes() {
+                                client = Some(peer);
                             }
                         }
-                    }
-                    Ok((PlainUdpKind::Fragment, _, body)) => {
-                        if client != Some(peer) {
-                            tracing::trace!("ignored plaintext udp fragment from unpinned endpoint {peer}");
-                            continue;
+                        Ok((PlainUdpKind::Keepalive, _, _)) => {}
+                        Ok((PlainUdpKind::Data, _, body)) => {
+                            let overhead = Instant::now();
+                            if let Ok((dst, data)) = decode_udp(body) {
+                                if socket.send_to(data, dst).await.is_ok() {
+                                    client_to_public.record(overhead.elapsed());
+                                }
+                            }
                         }
-                        let fragment = match decode_udp_fragment_body(body) {
-                            Ok(fragment) => fragment,
-                            Err(e) => {
-                                tracing::debug!("invalid plaintext udp fragment from client: {e:#}");
+                        Ok((PlainUdpKind::Fragment, _, body)) => {
+                            let fragment = match decode_udp_fragment_body(body) {
+                                Ok(fragment) => fragment,
+                                Err(e) => {
+                                    tracing::debug!("invalid plaintext udp fragment from client: {e:#}");
+                                    continue;
+                                }
+                            };
+                            let Some(frame) = reassembly.push(fragment, Instant::now()) else {
                                 continue;
-                            }
-                        };
-                        let Some(frame) = reassembly.push(fragment, Instant::now()) else {
-                            continue;
-                        };
-                        let overhead = Instant::now();
-                        if let Ok((dst, data)) = decode_udp(&frame) {
-                            if socket.send_to(data, dst).await.is_ok() {
-                                diagnostics.client_to_public.record(overhead.elapsed());
+                            };
+                            let overhead = Instant::now();
+                            if let Ok((dst, data)) = decode_udp(&frame) {
+                                if socket.send_to(data, dst).await.is_ok() {
+                                    client_to_public.record(overhead.elapsed());
+                                }
                             }
                         }
+                        Ok((PlainUdpKind::DiagPing, _, body)) => {
+                            diagnostics.public_to_client.record_batch(&mut public_to_client);
+                            diagnostics.client_to_public.record_batch(&mut client_to_public);
+                            let Some(body) = encode_diag_pong_body(body, &diagnostics) else {
+                                tracing::debug!("ignored malformed plaintext udp diagnostic ping");
+                                continue;
+                            };
+                            if let Err(e) = send_plain_udp_packet_to(
+                                socket.as_ref(),
+                                peer,
+                                &mut seq,
+                                PlainUdpKind::DiagPong,
+                                &body,
+                                &key,
+                            )
+                            .await
+                            {
+                                tracing::debug!("sending plaintext udp diagnostic pong failed: {e:#}");
+                            }
+                        }
+                        Ok((PlainUdpKind::DiagPong, _, _)) => {}
+                        Err(_) => {}
                     }
-                    Ok((PlainUdpKind::DiagPing, _, body)) => {
-                        if client != Some(peer) {
-                            tracing::trace!("ignored plaintext udp diagnostic ping from unpinned endpoint {peer}");
+                    continue;
+                }
+
+                if peek_plain_udp_kind(packet) == Some(PlainUdpKind::Hello) {
+                    match decode_plain_udp(packet, &key) {
+                        Ok((PlainUdpKind::Hello, _, body)) => {
+                            if body == token.as_bytes() {
+                                client = Some(peer);
+                            }
                             continue;
                         }
-                        let Some(body) = encode_diag_pong_body(body, &diagnostics) else {
-                            tracing::debug!("ignored malformed plaintext udp diagnostic ping");
-                            continue;
-                        };
-                        if let Err(e) = send_plain_udp_packet_to(
-                            &socket,
-                            peer,
-                            &mut seq,
-                            PlainUdpKind::DiagPong,
-                            &body,
-                            &key,
-                        )
+                        Ok(_) => continue,
+                        Err(_) => {}
+                    }
+                }
+
+                let Some(client) = client else {
+                    continue;
+                };
+
+                let overhead = Instant::now();
+                let body = encode_udp(peer, packet);
+                if let Err(e) =
+                    send_plain_udp_data_to(socket.as_ref(), client, &mut seq, &body, &key, udp_mtu)
                         .await
-                        {
-                            tracing::debug!("sending plaintext udp diagnostic pong failed: {e:#}");
-                        }
-                    }
-                    Ok((PlainUdpKind::DiagPong, _, _)) => {}
-                    Err(_) => {
-                        if client == Some(peer) {
-                            continue;
-                        }
-                        let Some(client) = client else {
-                            continue;
-                        };
-                        let overhead = Instant::now();
-                        let body = encode_udp(peer, packet);
-                        if let Err(e) =
-                            send_plain_udp_data_to(&socket, client, &mut seq, &body, &key, udp_mtu)
-                                .await
-                        {
-                            tracing::debug!("sending plaintext udp datagram to client failed: {e:#}");
-                        } else {
-                            diagnostics.public_to_client.record(overhead.elapsed());
-                        }
-                    }
+                {
+                    tracing::debug!("sending plaintext udp datagram to client failed: {e:#}");
+                } else {
+                    public_to_client.record(overhead.elapsed());
                 }
             }
         }
     }
+    diagnostics
+        .public_to_client
+        .record_batch(&mut public_to_client);
+    diagnostics
+        .client_to_public
+        .record_batch(&mut client_to_public);
     Ok(())
 }
 
@@ -280,6 +307,35 @@ struct FlowEntry {
     /// Milliseconds since the channel started; updated on each datagram in either direction
     /// (a lock-free store instead of a shared-map write on the per-packet path).
     last_seen: Arc<AtomicU64>,
+}
+
+struct SourcePoolState {
+    pool: Option<UdpSourcePool>,
+    used: HashSet<Ipv4Addr>,
+}
+
+impl SourcePoolState {
+    fn new(pool: Option<UdpSourcePool>) -> Self {
+        Self {
+            pool,
+            used: HashSet::new(),
+        }
+    }
+
+    fn reserve(&mut self, src: SocketAddr) -> Option<Option<Ipv4Addr>> {
+        let Some(pool) = self.pool else {
+            return Some(None);
+        };
+        let ip = select_pool_addr_from_used(src, pool, &self.used)?;
+        self.used.insert(ip);
+        Some(Some(ip))
+    }
+
+    fn release(&mut self, source_ip: Option<Ipv4Addr>) {
+        if let Some(ip) = source_ip {
+            self.used.remove(&ip);
+        }
+    }
 }
 
 /// Run a UDP tunnel's data channel, re-dialing it if it drops while the tunnel is still live.
@@ -410,6 +466,7 @@ async fn run_udp_channel(
     let started = Instant::now();
 
     let flows: Arc<DashMap<SocketAddr, FlowEntry>> = Arc::new(DashMap::new());
+    let source_pool_state = Arc::new(Mutex::new(SourcePoolState::new(source_pool)));
     let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(OUTBOUND_QUEUE);
 
     // Single writer of the data channel.
@@ -430,6 +487,7 @@ async fn run_udp_channel(
     // Idle-flow janitor: reap flows whose last activity is older than the idle timeout.
     let janitor = {
         let flows = flows.clone();
+        let source_pool_state = source_pool_state.clone();
         let cancel = link.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(10));
@@ -446,6 +504,7 @@ async fn run_udp_channel(
                             .collect();
                         for addr in expired {
                             if let Some((_, entry)) = flows.remove(&addr) {
+                                source_pool_state.lock().unwrap().release(entry.source_ip);
                                 entry.cancel.cancel();
                             }
                         }
@@ -477,8 +536,12 @@ async fn run_udp_channel(
                         if flows.len() >= MAX_FLOWS {
                             continue;
                         }
-                        let source_ip = match select_pool_addr(src, source_pool, &flows) {
-                            Some(ip) => ip,
+                        let reserved_source_ip = {
+                            let mut state = source_pool_state.lock().unwrap();
+                            state.reserve(src)
+                        };
+                        let source_ip = match reserved_source_ip {
+                            Some(source_ip) => source_ip,
                             None => {
                                 tracing::debug!("udp source pool exhausted for '{tunnel}'");
                                 continue;
@@ -486,7 +549,11 @@ async fn run_udp_channel(
                         };
                         let sock = match bind_local_flow(local, source_ip).await {
                             Ok(s) => Arc::new(s),
-                            Err(e) => { tracing::debug!("opening flow socket: {e}"); continue; }
+                            Err(e) => {
+                                source_pool_state.lock().unwrap().release(source_ip);
+                                tracing::debug!("opening flow socket: {e}");
+                                continue;
+                            }
                         };
                         let flow_cancel = link.child_token();
                         let last_seen = Arc::new(AtomicU64::new(now));
@@ -536,6 +603,7 @@ async fn run_plain_udp_channel(
     let started = Instant::now();
 
     let flows: Arc<DashMap<SocketAddr, FlowEntry>> = Arc::new(DashMap::new());
+    let source_pool_state = Arc::new(Mutex::new(SourcePoolState::new(settings.source_pool)));
     let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(OUTBOUND_QUEUE);
     let seq = Arc::new(AtomicU64::new(0));
     let mut reassembly = PlainUdpReassembler::new();
@@ -584,6 +652,7 @@ async fn run_plain_udp_channel(
 
     let janitor = {
         let flows = flows.clone();
+        let source_pool_state = source_pool_state.clone();
         let cancel = link.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(10));
@@ -600,6 +669,7 @@ async fn run_plain_udp_channel(
                             .collect();
                         for addr in expired {
                             if let Some((_, entry)) = flows.remove(&addr) {
+                                source_pool_state.lock().unwrap().release(entry.source_ip);
                                 entry.cancel.cancel();
                             }
                         }
@@ -610,11 +680,16 @@ async fn run_plain_udp_channel(
     };
 
     let mut buf = vec![0u8; UDP_PLAINTEXT_MAX_PACKET];
+    let mut diagnostics_flush = tokio::time::interval(UDP_DIAGNOSTICS_INTERVAL);
+    let mut client_server_to_local = LatencyBatch::default();
     loop {
         tokio::select! {
             _ = link.cancelled() => break,
             _ = reassembly_janitor.tick() => {
                 reassembly.prune_expired(Instant::now());
+            }
+            _ = diagnostics_flush.tick() => {
+                diagnostics.client_server_to_local.record_batch(&mut client_server_to_local);
             }
             r = channel.recv(&mut buf) => {
                 let n = match r {
@@ -647,6 +722,7 @@ async fn run_plain_udp_channel(
                         frame
                     }
                     PlainUdpKind::DiagPong => {
+                        diagnostics.client_server_to_local.record_batch(&mut client_server_to_local);
                         record_diag_pong(body, &started, diagnostics);
                         continue;
                     }
@@ -666,8 +742,12 @@ async fn run_plain_udp_channel(
                         if flows.len() >= MAX_FLOWS {
                             continue;
                         }
-                        let source_ip = match select_pool_addr(src, settings.source_pool, &flows) {
-                            Some(ip) => ip,
+                        let reserved_source_ip = {
+                            let mut state = source_pool_state.lock().unwrap();
+                            state.reserve(src)
+                        };
+                        let source_ip = match reserved_source_ip {
+                            Some(source_ip) => source_ip,
                             None => {
                                 tracing::debug!("udp source pool exhausted for '{tunnel}'");
                                 continue;
@@ -675,7 +755,11 @@ async fn run_plain_udp_channel(
                         };
                         let sock = match bind_local_flow(local, source_ip).await {
                             Ok(s) => Arc::new(s),
-                            Err(e) => { tracing::debug!("opening plaintext udp flow socket: {e}"); continue; }
+                            Err(e) => {
+                                source_pool_state.lock().unwrap().release(source_ip);
+                                tracing::debug!("opening plaintext udp flow socket: {e}");
+                                continue;
+                            }
                         };
                         let flow_cancel = link.child_token();
                         let last_seen = Arc::new(AtomicU64::new(now));
@@ -702,13 +786,16 @@ async fn run_plain_udp_channel(
                     }
                 };
                 if sock.send(data).await.is_ok() {
-                    diagnostics.client_server_to_local.record(overhead.elapsed());
+                    client_server_to_local.record(overhead.elapsed());
                 }
             }
         }
     }
 
     link.cancel();
+    diagnostics
+        .client_server_to_local
+        .record_batch(&mut client_server_to_local);
     let _ = writer.await;
     janitor.abort();
     Ok(())
@@ -728,24 +815,39 @@ struct FlowReader {
 
 async fn flow_reader(ctx: FlowReader) {
     let mut buf = vec![0u8; MAX_DATAGRAM];
+    let mut diagnostics_flush = tokio::time::interval(UDP_DIAGNOSTICS_INTERVAL);
+    let mut client_local_to_server = LatencyBatch::default();
     loop {
         tokio::select! {
             _ = ctx.cancel.cancelled() => break,
+            _ = diagnostics_flush.tick(), if ctx.diagnostics.is_some() => {
+                if let Some(diagnostics) = &ctx.diagnostics {
+                    diagnostics.client_local_to_server.record_batch(&mut client_local_to_server);
+                }
+            }
             r = ctx.sock.recv(&mut buf) => match r {
                 Ok(n) => {
                     ctx.last_seen.store(epoch_ms(&ctx.started), Relaxed);
                     ctx.counters.bytes_out.fetch_add(n as u64, Relaxed);
-                    let overhead = Instant::now();
+                    let body = encode_udp(ctx.src, &buf[..n]);
                     // try_send: if the link is backed up, drop rather than block or buffer.
-                    if ctx.out_tx.try_send(encode_udp(ctx.src, &buf[..n])).is_ok() {
-                        if let Some(diagnostics) = &ctx.diagnostics {
-                            diagnostics.client_local_to_server.record(overhead.elapsed());
+                    if ctx.diagnostics.is_some() {
+                        let overhead = Instant::now();
+                        if ctx.out_tx.try_send(body).is_ok() {
+                            client_local_to_server.record(overhead.elapsed());
                         }
+                    } else {
+                        let _ = ctx.out_tx.try_send(body);
                     }
                 }
                 Err(e) => { tracing::debug!("flow recv: {e}"); break; }
             }
         }
+    }
+    if let Some(diagnostics) = &ctx.diagnostics {
+        diagnostics
+            .client_local_to_server
+            .record_batch(&mut client_local_to_server);
     }
 }
 
@@ -764,8 +866,8 @@ async fn send_plain_udp_packet(
     Ok(())
 }
 
-async fn send_plain_udp_packet_to(
-    socket: &UdpSocket,
+async fn send_plain_udp_packet_to<S: UdpIo>(
+    socket: &S,
     dst: SocketAddr,
     seq: &mut u64,
     kind: PlainUdpKind,
@@ -787,24 +889,36 @@ async fn send_plain_udp_data_connected(
     key: &[u8; 32],
     udp_mtu: u16,
 ) -> Result<()> {
-    let packets = encode_plain_udp_data_packets(body, key, udp_mtu, || seq.fetch_add(1, Relaxed))?;
-    for packet in packets {
-        channel.send(&packet).await?;
+    match encode_plain_udp_data_packets(body, key, udp_mtu, || seq.fetch_add(1, Relaxed))? {
+        PlainUdpDataPackets::Single(packet) => {
+            channel.send(&packet).await?;
+        }
+        PlainUdpDataPackets::Fragments(packets) => {
+            for packet in packets {
+                channel.send(&packet).await?;
+            }
+        }
     }
     Ok(())
 }
 
-async fn send_plain_udp_data_to(
-    socket: &UdpSocket,
+async fn send_plain_udp_data_to<S: UdpIo>(
+    socket: &S,
     dst: SocketAddr,
     seq: &mut u64,
     body: &[u8],
     key: &[u8; 32],
     udp_mtu: u16,
 ) -> Result<()> {
-    let packets = encode_plain_udp_data_packets(body, key, udp_mtu, || next_seq(seq))?;
-    for packet in packets {
-        socket.send_to(&packet, dst).await?;
+    match encode_plain_udp_data_packets(body, key, udp_mtu, || next_seq(seq))? {
+        PlainUdpDataPackets::Single(packet) => {
+            socket.send_to(&packet, dst).await?;
+        }
+        PlainUdpDataPackets::Fragments(packets) => {
+            for packet in packets {
+                socket.send_to(&packet, dst).await?;
+            }
+        }
     }
     Ok(())
 }
@@ -882,12 +996,17 @@ fn read_u64(body: &[u8], offset: usize) -> Option<u64> {
     Some(u64::from_be_bytes(bytes.try_into().ok()?))
 }
 
+enum PlainUdpDataPackets {
+    Single(Bytes),
+    Fragments(Vec<Bytes>),
+}
+
 fn encode_plain_udp_data_packets(
     body: &[u8],
     key: &[u8; 32],
     udp_mtu: u16,
     mut next_seq: impl FnMut() -> u64,
-) -> Result<Vec<Bytes>> {
+) -> Result<PlainUdpDataPackets> {
     ensure!(
         body.len() <= UDP_PLAINTEXT_MAX_ENCAPSULATED,
         "udp plaintext datagram body exceeds maximum encapsulated length"
@@ -907,7 +1026,7 @@ fn encode_plain_udp_data_packets(
         let packet = encode_plain_udp(PlainUdpKind::Data, next_seq(), body, key)
             .context("encoding plaintext udp data packet")?;
         debug_assert!(packet.len() <= mtu);
-        return Ok(vec![packet]);
+        return Ok(PlainUdpDataPackets::Single(packet));
     }
 
     let chunk_capacity = mtu - UDP_PLAINTEXT_OVERHEAD - UDP_PLAINTEXT_FRAGMENT_HEADER;
@@ -932,7 +1051,7 @@ fn encode_plain_udp_data_packets(
         debug_assert!(packet.len() <= mtu);
         packets.push(packet);
     }
-    Ok(packets)
+    Ok(PlainUdpDataPackets::Fragments(packets))
 }
 
 async fn connect_plain_udp_socket(server_udp: &str) -> Result<UdpSocket> {
@@ -949,18 +1068,6 @@ async fn connect_plain_udp_socket(server_udp: &str) -> Result<UdpSocket> {
     let sock = UdpSocket::bind(bind).await?;
     sock.connect(server).await?;
     Ok(sock)
-}
-
-fn select_pool_addr(
-    src: SocketAddr,
-    source_pool: Option<UdpSourcePool>,
-    flows: &DashMap<SocketAddr, FlowEntry>,
-) -> Option<Option<Ipv4Addr>> {
-    let Some(pool) = source_pool else {
-        return Some(None);
-    };
-    let used: HashSet<Ipv4Addr> = flows.iter().filter_map(|e| e.value().source_ip).collect();
-    select_pool_addr_from_used(src, pool, &used).map(Some)
 }
 
 fn select_pool_addr_from_used(
@@ -1060,8 +1167,6 @@ impl PlainUdpReassembler {
     }
 
     fn push(&mut self, fragment: PlainUdpFragment<'_>, now: Instant) -> Option<Bytes> {
-        self.prune_expired(now);
-
         let id = fragment.fragment_id;
         let count = usize::from(fragment.fragment_count);
         let index = usize::from(fragment.fragment_index);
@@ -1228,6 +1333,13 @@ mod tests {
         }
     }
 
+    fn expect_fragment_packets(packets: PlainUdpDataPackets) -> Vec<Bytes> {
+        match packets {
+            PlainUdpDataPackets::Fragments(packets) => packets,
+            PlainUdpDataPackets::Single(_) => panic!("expected fragmented plaintext udp packets"),
+        }
+    }
+
     #[test]
     fn plaintext_udp_data_packets_fragment_to_mtu_and_reassemble() {
         let key = [1u8; 32];
@@ -1236,8 +1348,10 @@ mod tests {
         let body = encode_udp(peer, &payload);
         let mut seq = 0u64;
 
-        let packets = encode_plain_udp_data_packets(&body, &key, 512, || next_seq(&mut seq))
-            .expect("fragment packets");
+        let packets = expect_fragment_packets(
+            encode_plain_udp_data_packets(&body, &key, 512, || next_seq(&mut seq))
+                .expect("fragment packets"),
+        );
 
         assert!(packets.len() > 1);
         assert!(packets.iter().all(|packet| packet.len() <= 512));
@@ -1253,6 +1367,25 @@ mod tests {
         }
 
         assert_eq!(complete.as_deref(), Some(body.as_ref()));
+    }
+
+    #[test]
+    fn plaintext_udp_data_packets_use_single_fast_path() {
+        let key = [9u8; 32];
+        let peer: SocketAddr = "127.0.0.1:40009".parse().unwrap();
+        let body = encode_udp(peer, b"hello");
+        let mut seq = 0u64;
+
+        let packet = encode_plain_udp_data_packets(&body, &key, 512, || next_seq(&mut seq))
+            .expect("single packet");
+
+        let PlainUdpDataPackets::Single(packet) = packet else {
+            panic!("expected single plaintext udp packet");
+        };
+        assert!(packet.len() <= 512);
+        let (kind, _, got_body) = decode_plain_udp(&packet, &key).unwrap();
+        assert_eq!(kind, PlainUdpKind::Data);
+        assert_eq!(got_body, body.as_ref());
     }
 
     #[test]
@@ -1285,13 +1418,27 @@ mod tests {
     }
 
     #[test]
+    fn udp_source_pool_state_releases_reserved_ips() {
+        let pool: UdpSourcePool = "127.64.0.9/32".parse().unwrap();
+        let first: SocketAddr = "198.51.100.10:40000".parse().unwrap();
+        let second: SocketAddr = "198.51.100.11:40000".parse().unwrap();
+        let mut state = SourcePoolState::new(Some(pool));
+
+        let first_ip = state.reserve(first).unwrap();
+        assert_eq!(state.reserve(second), None);
+        state.release(first_ip);
+        assert_eq!(state.reserve(second), Some(first_ip));
+    }
+
+    #[test]
     fn plaintext_udp_reassembly_ignores_duplicate_fragment() {
         let key = [2u8; 32];
         let peer: SocketAddr = "127.0.0.1:40001".parse().unwrap();
         let body = encode_udp(peer, &vec![0x66; 1600]);
         let mut seq = 0u64;
-        let packets =
-            encode_plain_udp_data_packets(&body, &key, 512, || next_seq(&mut seq)).unwrap();
+        let packets = expect_fragment_packets(
+            encode_plain_udp_data_packets(&body, &key, 512, || next_seq(&mut seq)).unwrap(),
+        );
         let now = Instant::now();
         let mut reassembly = PlainUdpReassembler::new();
 
@@ -1315,8 +1462,9 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:40002".parse().unwrap();
         let body = encode_udp(peer, &vec![0x77; 1600]);
         let mut seq = 0u64;
-        let packets =
-            encode_plain_udp_data_packets(&body, &key, 512, || next_seq(&mut seq)).unwrap();
+        let packets = expect_fragment_packets(
+            encode_plain_udp_data_packets(&body, &key, 512, || next_seq(&mut seq)).unwrap(),
+        );
         let start = Instant::now();
         let mut reassembly = PlainUdpReassembler::new();
 
@@ -1325,6 +1473,7 @@ mod tests {
         assert!(reassembly.push(first, start).is_none());
 
         let late = start + PLAIN_REASSEMBLY_TIMEOUT + Duration::from_millis(1);
+        reassembly.prune_expired(late);
         let mut complete = None;
         for packet in packets.iter().skip(1) {
             let (_, _, fragment_body) = decode_plain_udp(packet, &key).unwrap();
@@ -1363,6 +1512,114 @@ mod tests {
             17
         );
         assert!(encode_diag_pong_body(b"short", &server).is_none());
+    }
+
+    #[tokio::test]
+    async fn server_plain_forward_routes_non_client_data_as_public_payload() {
+        let MockUdpHarness {
+            socket,
+            incoming_tx,
+            mut outgoing_rx,
+        } = mock_udp();
+        let token = Uuid::new_v4();
+        let key = [10u8; 32];
+        let client: SocketAddr = "127.0.0.1:41000".parse().unwrap();
+        let public_peer: SocketAddr = "198.51.100.10:42000".parse().unwrap();
+        let decoded_dst: SocketAddr = "203.0.113.44:43000".parse().unwrap();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(server_plain_forward_io(
+            socket,
+            token,
+            key,
+            crate::protocol::DEFAULT_UDP_MTU,
+            cancel.clone(),
+        ));
+
+        let hello = encode_plain_udp(PlainUdpKind::Hello, 0, token.as_bytes(), &key).unwrap();
+        incoming_tx.send((hello.to_vec(), client)).await.unwrap();
+
+        let body = encode_udp(decoded_dst, b"inner");
+        let pthu_data = encode_plain_udp(PlainUdpKind::Data, 1, &body, &key).unwrap();
+        incoming_tx
+            .send((pthu_data.to_vec(), public_peer))
+            .await
+            .unwrap();
+
+        let (out, dst) = timeout(Duration::from_secs(1), outgoing_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dst, client);
+        let (kind, _, routed_body) = decode_plain_udp(&out, &key).unwrap();
+        assert_eq!(kind, PlainUdpKind::Data);
+        let (routed_src, routed_data) = decode_udp(routed_body).unwrap();
+        assert_eq!(routed_src, public_peer);
+        assert_eq!(routed_data, pthu_data.as_ref());
+
+        cancel.cancel();
+        drop(incoming_tx);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_plain_forward_allows_authenticated_hello_repin() {
+        let MockUdpHarness {
+            socket,
+            incoming_tx,
+            mut outgoing_rx,
+        } = mock_udp();
+        let token = Uuid::new_v4();
+        let key = [11u8; 32];
+        let first_client: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+        let second_client: SocketAddr = "127.0.0.1:41002".parse().unwrap();
+        let public_peer: SocketAddr = "198.51.100.11:42000".parse().unwrap();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(server_plain_forward_io(
+            socket,
+            token,
+            key,
+            crate::protocol::DEFAULT_UDP_MTU,
+            cancel.clone(),
+        ));
+
+        let first_hello = encode_plain_udp(PlainUdpKind::Hello, 0, token.as_bytes(), &key).unwrap();
+        incoming_tx
+            .send((first_hello.to_vec(), first_client))
+            .await
+            .unwrap();
+        let second_hello =
+            encode_plain_udp(PlainUdpKind::Hello, 1, token.as_bytes(), &key).unwrap();
+        incoming_tx
+            .send((second_hello.to_vec(), second_client))
+            .await
+            .unwrap();
+        incoming_tx
+            .send((b"public".to_vec(), public_peer))
+            .await
+            .unwrap();
+
+        let (out, dst) = timeout(Duration::from_secs(1), outgoing_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dst, second_client);
+        let (kind, _, routed_body) = decode_plain_udp(&out, &key).unwrap();
+        assert_eq!(kind, PlainUdpKind::Data);
+        let (routed_src, routed_data) = decode_udp(routed_body).unwrap();
+        assert_eq!(routed_src, public_peer);
+        assert_eq!(routed_data, b"public");
+
+        cancel.cancel();
+        drop(incoming_tx);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
