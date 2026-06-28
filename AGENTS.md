@@ -11,8 +11,7 @@ relays public traffic back over those outbound connections. One binary, clap sub
 
 ## Commands
 
-Standard cargo. Note: on this dev machine `cargo` is not on the non-interactive shell PATH —
-invoke it by full path `C:\Users\david\.cargo\bin\cargo.exe`.
+Standard Cargo commands; use the `cargo` available in the current environment.
 
 - `cargo build` / `cargo build --release`
 - `cargo test` — unit tests (in `src/`) + the integration suite in `tests/e2e.rs`
@@ -89,7 +88,7 @@ default config lives next to the executable.
   `AddrInUse`.
 
 ## Deployment
-A live relay runs on `papez@10xdev.sk` as a hardened systemd service (`porthole.service`,
-`DynamicUser`; cert/secret under `/var/lib/porthole` and `/etc/porthole`). Repo:
+Production relays can run as hardened systemd services using `porthole.service` and
+`DynamicUser`; keep service data and secrets in deployment-specific locations. Repo:
 `github.com/sudo-ds/porthole`. Build a portable Linux binary with the
-`x86_64-unknown-linux-musl` target, or build on the box.
+`x86_64-unknown-linux-musl` target, or build directly on the target host.
