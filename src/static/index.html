@@ -599,12 +599,41 @@ function publicCell(st, t) {
   return '<span class="pill">pending</span>';
 }
 
+function setText(el, value) {
+  const text = String(value ?? '');
+  if (el.textContent !== text) el.textContent = text;
+}
+
+function setCellHtml(cell, html) {
+  if (cell.__lastHtml === html) return;
+  if (cell.contains(document.activeElement)) return;
+  cell.innerHTML = html;
+  cell.__lastHtml = html;
+}
+
+function ensureRow(rows, name) {
+  let tr = [...rows.children].find(row => row.dataset.name === name);
+  if (tr) return tr;
+  tr = document.createElement('tr');
+  tr.dataset.name = name;
+  const labels = ['Name', 'Proto', 'Local', 'Public', 'In', 'Out', 'Rate', 'Conns', 'Diag', 'Actions'];
+  const classes = ['', '', '', 'public', 'metric', 'metric', 'metric', 'metric', 'diag', 'actions'];
+  labels.forEach((label, i) => {
+    const td = document.createElement('td');
+    td.dataset.label = label;
+    if (classes[i]) td.className = classes[i];
+    tr.appendChild(td);
+  });
+  return tr;
+}
+
 function renderRows(st) {
   const rows = document.getElementById('rows');
-  rows.innerHTML = '';
+  const seen = new Set();
   document.getElementById('empty').hidden = st.tunnels.length > 0;
-  for (const t of st.tunnels) {
-    const tr = document.createElement('tr');
+  st.tunnels.forEach((t, index) => {
+    const tr = ensureRow(rows, t.name);
+    seen.add(t.name);
     const live = t.up && t.enabled && !st.paused;
     const state = st.paused && t.enabled ? 'paused' : t.enabled ? (live ? 'live' : 'down') : 'disabled';
     const dot = `<span class="dot ${live ? 'up':'down'}" title="${state}"></span>`;
@@ -617,18 +646,23 @@ function renderRows(st) {
     const sourcePoolBadge = hasUdp && t.udp_source_pool ? `<span class="pill source-badge">pool ${escapeHtml(t.udp_source_pool)}</span>` : '';
     const portBadge = t.bindings && t.bindings.length > 1 ? `<span class="pill">${t.bindings.length} ports</span>` : '';
     const en = t.enabled ? 'disable' : 'enable';
-    tr.innerHTML =
-      `<td data-label="Name"><span class="name-cell">${dot}<strong>${name}</strong></span></td>` +
-      `<td data-label="Proto" class="${proto}"><span class="proto-cell">${escapeHtml(t.proto)}${encryptionBadge}${portBadge}${mtuBadge}${sourcePoolBadge}${proxyBadge}</span></td>` +
-      `<td data-label="Local"><span class="endpoint">${escapeHtml(formatLocalInput(t))}</span></td>` +
-      `<td data-label="Public" class="public">${publicCell(st, t)}</td>` +
-      `<td data-label="In" class="metric">${fmtBytes(t.bytes_in)}</td>` +
-      `<td data-label="Out" class="metric">${fmtBytes(t.bytes_out)}</td>` +
-      `<td data-label="Rate" class="metric">${fmtBps(t.rate_in_bps)} / ${fmtBps(t.rate_out_bps)}</td>` +
-      `<td data-label="Conns" class="metric">${escapeHtml(t.active)}</td>` +
-      `<td data-label="Diag" class="diag">${diagSummary(t)}</td>` +
-      `<td data-label="Actions" class="actions"><span class="action-buttons"><button data-edit="${name}">edit</button><button data-toggle="${name}">${en}</button><button class="danger" data-remove="${name}">remove</button></span></td>`;
-    rows.appendChild(tr);
+    const cells = tr.children;
+    cells[1].className = proto;
+    setCellHtml(cells[0], `<span class="name-cell">${dot}<strong>${name}</strong></span>`);
+    setCellHtml(cells[1], `<span class="proto-cell">${escapeHtml(t.proto)}${encryptionBadge}${portBadge}${mtuBadge}${sourcePoolBadge}${proxyBadge}</span>`);
+    setCellHtml(cells[2], `<span class="endpoint">${escapeHtml(formatLocalInput(t))}</span>`);
+    setCellHtml(cells[3], publicCell(st, t));
+    setCellHtml(cells[4], fmtBytes(t.bytes_in));
+    setCellHtml(cells[5], fmtBytes(t.bytes_out));
+    setCellHtml(cells[6], `${fmtBps(t.rate_in_bps)} / ${fmtBps(t.rate_out_bps)}`);
+    setCellHtml(cells[7], escapeHtml(t.active));
+    setCellHtml(cells[8], diagSummary(t));
+    setCellHtml(cells[9], `<span class="action-buttons"><button data-edit="${name}">edit</button><button data-toggle="${name}">${en}</button><button class="danger" data-remove="${name}">remove</button></span>`);
+    const current = rows.children[index];
+    if (current !== tr) rows.insertBefore(tr, current || null);
+  });
+  for (const tr of [...rows.querySelectorAll('tr[data-name]')]) {
+    if (!seen.has(tr.dataset.name)) tr.remove();
   }
 }
 
@@ -638,16 +672,16 @@ async function refresh() {
   catch { document.getElementById('conn').className = 'dot down'; return; }
   lastStatus = st;
   document.getElementById('conn').className = 'dot ' + (st.connected ? 'up' : 'down');
-  document.getElementById('server').textContent = st.server;
-  document.getElementById('uptime').textContent = fmtDur(st.uptime_secs);
-  document.getElementById('range').textContent = st.max_port ? `(allowed ${st.min_port}-${st.max_port})` : '';
+  setText(document.getElementById('server'), st.server);
+  setText(document.getElementById('uptime'), fmtDur(st.uptime_secs));
+  setText(document.getElementById('range'), st.max_port ? `(allowed ${st.min_port}-${st.max_port})` : '');
   const editRange = document.querySelector('[data-edit-range]');
-  if (editRange) editRange.textContent = st.max_port ? `(allowed ${st.min_port}-${st.max_port})` : '';
+  if (editRange) setText(editRange, st.max_port ? `(allowed ${st.min_port}-${st.max_port})` : '');
   const pauseState = document.getElementById('pauseState');
-  pauseState.textContent = st.paused ? 'paused' : 'running';
+  setText(pauseState, st.paused ? 'paused' : 'running');
   pauseState.className = 'pill' + (st.paused ? ' paused' : '');
   const pauseBtn = document.getElementById('pauseBtn');
-  pauseBtn.textContent = st.paused ? 'Unpause all' : 'Pause all';
+  setText(pauseBtn, st.paused ? 'Unpause all' : 'Pause all');
   pauseBtn.dataset.paused = st.paused ? '1' : '0';
   updateOverview(st);
   renderRows(st);
