@@ -292,7 +292,11 @@ async fn add_tunnel(State(st): State<AppState>, Json(req): Json<AddRequest>) -> 
     let (local_addr, parsed_local_ports) = match parse_local_endpoint(&req.local) {
         Ok(a) => a,
         Err(_) => {
-            return (StatusCode::BAD_REQUEST, "local must be HOST:PORT or PORT").into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                "local must be HOST:PORT, PORT, PORT-PORT, or PORT,PORT",
+            )
+                .into_response();
         }
     };
     let local_ports = req.local_ports.or(parsed_local_ports);
@@ -388,6 +392,9 @@ fn parse_local_endpoint(local: &str) -> Result<(SocketAddr, Option<String>)> {
     if let Ok(port) = local.parse::<u16>() {
         return Ok((SocketAddr::from(([127, 0, 0, 1], port)), None));
     }
+    if !local.contains(':') {
+        return config::parse_local_endpoint(&format!("127.0.0.1:{local}"));
+    }
     config::parse_local_endpoint(local)
 }
 
@@ -418,6 +425,28 @@ mod tests {
             (
                 "127.0.0.1:4000".parse::<SocketAddr>().unwrap(),
                 Some("4000-4002".into())
+            )
+        );
+    }
+
+    #[test]
+    fn parse_local_endpoint_defaults_bare_range_to_loopback() {
+        assert_eq!(
+            parse_local_endpoint("4000-4002").unwrap(),
+            (
+                "127.0.0.1:4000".parse::<SocketAddr>().unwrap(),
+                Some("4000-4002".into())
+            )
+        );
+    }
+
+    #[test]
+    fn parse_local_endpoint_defaults_bare_list_to_loopback() {
+        assert_eq!(
+            parse_local_endpoint("4000,4002").unwrap(),
+            (
+                "127.0.0.1:4000".parse::<SocketAddr>().unwrap(),
+                Some("4000,4002".into())
             )
         );
     }

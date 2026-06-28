@@ -436,7 +436,7 @@
       <label class="field-encryption">Encryption<select name="encrypted"><option value="false">Plain</option><option value="true">TLS</option></select></label>
       <label class="field-mtu" data-mtu>UDP MTU<input name="udp_mtu" type="number" min="256" max="65507" placeholder="1200"></label>
       <label class="field-source-pool" data-pool>UDP source pool<input name="udp_source_pool" placeholder="127.64.0.0/16"></label>
-      <label class="field-local">Local address<input name="local" placeholder="25565 or 127.0.0.1:4000-6000" required></label>
+      <label class="field-local">Local address<input name="local" placeholder="25565, 2000-3000, or 127.0.0.1:4000-6000" required></label>
       <label class="field-remote"><span class="label-row">Public start <small id="range" class="hint"></small></span><input name="remote_port" type="number" min="0" max="65535" placeholder="auto"></label>
       <label class="field-proxy" data-proxy>Proxy<select name="proxy_protocol"><option value="off">Off</option><option value="v1">PROXY v1</option><option value="v2">PROXY v2</option></select></label>
       <button class="primary field-submit" type="submit">Add</button>
@@ -468,6 +468,7 @@
 
 <script>
 let lastStatus = null;
+const DEFAULT_UDP_SOURCE_POOL = '127.64.0.0/16';
 
 const fmtBytes = n => {
   const u = ['B','KB','MB','GB','TB']; let i = 0; n = Number(n || 0);
@@ -664,7 +665,13 @@ function syncAdvancedControls(form) {
   const hasUdp = proto === 'udp' || proto === 'both';
   proxy.hidden = !tcp; proxySelect.disabled = !tcp; if (!tcp) proxySelect.value = 'off';
   mtu.hidden = !hasUdp; mtuInput.disabled = !hasUdp; if (!hasUdp) mtuInput.value = '';
-  pool.hidden = !hasUdp; poolInput.disabled = !hasUdp; if (!hasUdp) poolInput.value = '';
+  pool.hidden = !hasUdp; poolInput.disabled = !hasUdp;
+  if (!hasUdp) {
+    poolInput.value = '';
+    poolInput.dataset.userEdited = '';
+  } else if (form.id === 'add' && !poolInput.value && poolInput.dataset.userEdited !== '1') {
+    poolInput.value = DEFAULT_UDP_SOURCE_POOL;
+  }
 }
 
 async function submitTunnel(form, errorEl, closeOnSuccess) {
@@ -679,7 +686,11 @@ async function submitTunnel(form, errorEl, closeOnSuccess) {
   const res = await fetch('/api/tunnels', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   if (res.ok) {
     if (closeOnSuccess) document.getElementById('editor').close();
-    else form.reset();
+    else {
+      form.reset();
+      const poolInput = form.elements.namedItem('udp_source_pool');
+      if (poolInput) poolInput.dataset.userEdited = '';
+    }
     syncAdvancedControls(form);
     refresh();
   } else {
@@ -732,6 +743,9 @@ document.getElementById('pauseBtn').addEventListener('click', async e => {
 document.getElementById('closeEditor').addEventListener('click', () => document.getElementById('editor').close());
 for (const form of [document.getElementById('add'), document.getElementById('edit')]) {
   form.querySelector('[data-proto]').addEventListener('change', () => syncAdvancedControls(form));
+  form.elements.namedItem('udp_source_pool').addEventListener('input', e => {
+    e.target.dataset.userEdited = '1';
+  });
   syncAdvancedControls(form);
 }
 document.getElementById('add').addEventListener('submit', e => {
