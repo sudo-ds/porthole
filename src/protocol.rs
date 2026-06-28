@@ -30,10 +30,10 @@ use uuid::Uuid;
 
 pub const DEFAULT_CONTROL_PORT: u16 = 7835;
 pub const DEFAULT_WEB_BIND: &str = "127.0.0.1:4040";
-/// Max length-delimited frame. Must exceed the largest UDP datagram (`udp::MAX_DATAGRAM`,
-/// 65535) plus the 19-byte address header, or a maximum-size datagram would be rejected by
-/// the codec and tear down the whole channel. 64 KiB + slack covers it; control JSON is tiny.
-pub const MAX_FRAME: usize = 64 * 1024 + 256;
+/// Max length-delimited frame. Must exceed both the largest UDP datagram (`udp::MAX_DATAGRAM`,
+/// 65535) plus its 19-byte address header and the largest multi-port `Accepted` control JSON.
+/// The 2048-port cap can produce hundreds of KiB of per-binding public/token/auth metadata.
+pub const MAX_FRAME: usize = 512 * 1024;
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
@@ -757,6 +757,41 @@ mod tests {
         let j = serde_json::to_vec(&s).unwrap();
         let back: ServerMessage = serde_json::from_slice(&j).unwrap();
         assert_eq!(s, back);
+    }
+
+    #[test]
+    fn max_udp_bindings_accepted_message_fits_frame_limit() {
+        let key = encode_udp_auth_key(&[7u8; 32]);
+        let bindings = (0..crate::config::MAX_TUNNEL_PORTS)
+            .map(|i| {
+                let port = 10_000 + i as u16;
+                AcceptedBinding {
+                    local_port: port,
+                    remote_port: port,
+                    public_addr: format!("203.0.113.7:{port}"),
+                    token: Some(Uuid::new_v4()),
+                    udp_auth_key: Some(key.clone()),
+                    udp_mtu: Some(DEFAULT_UDP_MTU),
+                }
+            })
+            .collect();
+        let msg = ServerMessage::Accepted {
+            name: "range-test".into(),
+            proto: Proto::Udp,
+            public_addr: "203.0.113.7:10000".into(),
+            remote_port: 10_000,
+            encrypted: false,
+            token: Some(Uuid::new_v4()),
+            udp_auth_key: Some(key),
+            udp_mtu: Some(DEFAULT_UDP_MTU),
+            bindings,
+        };
+        let bytes = serde_json::to_vec(&msg).unwrap();
+        assert!(
+            bytes.len() <= MAX_FRAME,
+            "Accepted frame is {} bytes but MAX_FRAME is {MAX_FRAME}",
+            bytes.len()
+        );
     }
 
     #[test]

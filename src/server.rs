@@ -308,7 +308,10 @@ impl Server {
                         let Some(msg) = msg else { break };
                         match serde_json::to_vec(&msg) {
                             Ok(bytes) => {
-                                if sink.send(Bytes::from(bytes)).await.is_err() { break; }
+                                if let Err(e) = sink.send(Bytes::from(bytes)).await {
+                                    tracing::warn!("control send failed: {e}");
+                                    break;
+                                }
                             }
                             Err(e) => tracing::error!("serialize: {e}"),
                         }
