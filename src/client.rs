@@ -25,6 +25,7 @@ use crate::cli::{ClientArgs, JoinArgs};
 use crate::config::{
     self, save_client_file, ClientFile, ClientSettings, ProxyProtocol, TunnelConfig, UdpSourcePool,
 };
+use crate::diagnostics::PlainUdpDiagnostics;
 use crate::invite;
 use crate::protocol::{
     self, ClientMessage, Proto, ServerMessage, Wire, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT,
@@ -57,6 +58,7 @@ pub struct TunnelStatus {
     /// Last rejection reason from the server, if any (shown in the web UI).
     pub error: Mutex<Option<String>>,
     pub counters: Arc<Counters>,
+    pub diagnostics: Arc<PlainUdpDiagnostics>,
 }
 
 /// State shared between the control loop, data tasks, and the web UI.
@@ -282,6 +284,7 @@ fn status_from(t: &TunnelConfig) -> TunnelStatus {
         up: AtomicBool::new(false),
         error: Mutex::new(None),
         counters: Arc::new(Counters::default()),
+        diagnostics: Arc::new(PlainUdpDiagnostics::default()),
     }
 }
 
@@ -509,13 +512,21 @@ fn apply_accepted(shared: &Arc<ClientShared>, conn_cancel: &CancellationToken, m
         *s.public_addr.lock().unwrap() = Some(public.clone());
         *s.error.lock().unwrap() = None;
         s.up.store(true, Relaxed);
+        if proto.has_udp() && !encrypted {
+            s.diagnostics.reset();
+        }
     }
     tracing::info!("tunnel '{name}' ({proto}) is live at {public}");
 
     if proto.has_udp() {
         if let Some(token) = token {
-            let (local, udp_source_pool, counters) = match shared.status.get(&name) {
-                Some(s) => (s.local_addr, s.udp_source_pool, s.counters.clone()),
+            let (local, udp_source_pool, counters, diagnostics) = match shared.status.get(&name) {
+                Some(s) => (
+                    s.local_addr,
+                    s.udp_source_pool,
+                    s.counters.clone(),
+                    s.diagnostics.clone(),
+                ),
                 None => return,
             };
             if encrypted {
@@ -556,6 +567,7 @@ fn apply_accepted(shared: &Arc<ClientShared>, conn_cancel: &CancellationToken, m
                         source_pool: udp_source_pool,
                     },
                     counters,
+                    diagnostics,
                     conn_cancel.clone(),
                 ));
             }

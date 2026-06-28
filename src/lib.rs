@@ -8,6 +8,7 @@ pub mod banner;
 pub mod cli;
 pub mod client;
 pub mod config;
+pub mod diagnostics;
 pub mod invite;
 pub mod logging;
 pub mod net;

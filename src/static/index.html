@@ -91,7 +91,7 @@
   }
   table {
     width:100%;
-    min-width:1040px;
+    min-width:1140px;
     border-collapse:separate;
     border-spacing:0;
   }
@@ -131,6 +131,15 @@
     font-variant-numeric:tabular-nums;
     white-space:nowrap;
   }
+  .diag {
+    min-width:140px;
+    font:12px/1.35 "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+    font-variant-numeric:tabular-nums;
+    white-space:nowrap;
+  }
+  .diag-cell { display:flex; flex-direction:column; gap:2px; }
+  .diag-sub { color:var(--muted); font-size:11px; }
+  .muted-mono { color:var(--muted-2); font:13px/1.45 "JetBrains Mono", "Cascadia Mono", Consolas, monospace; }
   td.actions { width:168px; }
   .action-buttons { display:grid; grid-template-columns:78px 78px; gap:8px; align-items:center; }
   .action-buttons button { width:100%; text-align:center; }
@@ -305,7 +314,7 @@
     <table aria-label="Tunnels">
       <thead><tr>
         <th>Name</th><th>Proto</th><th>Local</th><th>Public</th>
-        <th>In</th><th>Out</th><th>Conns</th><th></th>
+        <th>In</th><th>Out</th><th>Conns</th><th>Diag</th><th></th>
       </tr></thead>
       <tbody id="rows"></tbody>
     </table>
@@ -337,9 +346,22 @@ const fmtDur = s => {
   const d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
   if (d) return `${d}d ${h}h`; if (h) return `${h}h ${m}m`; if (m) return `${m}m`; return `${s}s`;
 };
+const fmtMs = n => {
+  if (n === null || n === undefined || !Number.isFinite(n)) return '--';
+  if (n < 1) return `${Math.max(1, Math.round(n * 1000))} us`;
+  if (n < 10) return `${n.toFixed(2)} ms`;
+  if (n < 100) return `${n.toFixed(1)} ms`;
+  return `${Math.round(n)} ms`;
+};
 const escapeHtml = value => String(value).replace(/[&<>"']/g, ch => ({
   '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
 }[ch]));
+function diagSummary(d) {
+  if (!d || d.rtt_ms === null || d.rtt_ms === undefined) return '<span class="muted-mono">--</span>';
+  const excess = d.excess_ms === null || d.excess_ms === undefined ? '' : `<span class="diag-sub">+${fmtMs(d.excess_ms)} excess</span>`;
+  const relay = d.relay_overhead_ms === null || d.relay_overhead_ms === undefined ? '' : `<span class="diag-sub">sw ${fmtMs(d.relay_overhead_ms)}</span>`;
+  return `<span class="diag-cell"><span>${fmtMs(d.rtt_ms)}</span>${excess}${relay}</span>`;
+}
 async function copyText(text) {
   if (navigator.clipboard && window.isSecureContext) {
     await navigator.clipboard.writeText(text);
@@ -409,6 +431,7 @@ async function refresh() {
       `<td data-label="In" class="metric">${fmtBytes(t.bytes_in)}</td>` +
       `<td data-label="Out" class="metric">${fmtBytes(t.bytes_out)}</td>` +
       `<td data-label="Conns" class="metric">${escapeHtml(t.active)}</td>` +
+      `<td data-label="Diag" class="diag">${diagSummary(t.diagnostics)}</td>` +
       `<td data-label="Actions" class="actions"><span class="action-buttons"><button data-toggle="${name}">${en}</button>` +
       `<button class="danger" data-remove="${name}">remove</button></span></td>`;
     rows.appendChild(tr);

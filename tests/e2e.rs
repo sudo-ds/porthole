@@ -700,6 +700,57 @@ async fn udp_tunnel_roundtrip() {
 
 #[tokio::test]
 #[ignore = "uses real loopback sockets; run explicitly for relay smoke testing"]
+async fn plaintext_udp_diagnostics_appear_in_web_status() {
+    install();
+    let echo = udp_echo().await;
+    let (ingress, public, web) = (free_port(), free_port(), free_port());
+    let (cert, key) = temp_paths("udp-diagnostics");
+    let ss = server_settings(ingress, public, cert, key);
+    let (_acceptor, fingerprint) = tls::server_acceptor(&ss).expect("generate cert");
+    tokio::spawn(server::run(ss));
+
+    let tunnel = TunnelConfig {
+        name: "u".into(),
+        protocol: Proto::Udp,
+        local_addr: echo,
+        remote_port: Some(public),
+        enabled: true,
+        encrypted: false,
+        udp_mtu: None,
+        udp_source_pool: None,
+        proxy_protocol: ProxyProtocol::Off,
+    };
+    tokio::spawn(client::run(client_settings_with(
+        ingress,
+        fingerprint,
+        vec![tunnel],
+        format!("127.0.0.1:{web}"),
+        None,
+        false,
+    )));
+
+    let public_addr: SocketAddr = format!("127.0.0.1:{public}").parse().unwrap();
+    assert_udp_roundtrip(public_addr, b"diag").await;
+
+    let web_addr: SocketAddr = format!("127.0.0.1:{web}").parse().unwrap();
+    wait_for_status(web_addr, |st| {
+        let Some(tunnel) = st["tunnels"]
+            .as_array()
+            .and_then(|tunnels| tunnels.iter().find(|t| t["name"].as_str() == Some("u")))
+        else {
+            return false;
+        };
+        let diagnostics = &tunnel["diagnostics"];
+        diagnostics["rtt_ms"].is_number()
+            && diagnostics["network_floor_ms"].is_number()
+            && diagnostics["relay_overhead_ms"].is_number()
+            && diagnostics["server_public_to_client_ms"].is_number()
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "uses real loopback sockets; run explicitly for relay smoke testing"]
 async fn udp_source_pool_presents_distinct_loopback_sources() {
     install();
     let (local, mut seen) = udp_peer_report_echo().await;

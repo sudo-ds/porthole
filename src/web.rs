@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 
 use crate::client::{ClientShared, Command};
 use crate::config::{self, TunnelConfig};
+use crate::diagnostics::{LatencySnapshot, PlainUdpDiagnostics};
 use crate::protocol::Proto;
 
 #[derive(Clone)]
@@ -80,6 +81,19 @@ struct TunnelView {
     bytes_in: u64,
     bytes_out: u64,
     active: u32,
+    diagnostics: Option<DiagnosticsView>,
+}
+
+#[derive(Serialize)]
+struct DiagnosticsView {
+    rtt_ms: Option<f64>,
+    network_floor_ms: Option<f64>,
+    excess_ms: Option<f64>,
+    relay_overhead_ms: Option<f64>,
+    server_public_to_client_ms: Option<f64>,
+    server_client_to_public_ms: Option<f64>,
+    client_server_to_local_ms: Option<f64>,
+    client_local_to_server_ms: Option<f64>,
 }
 
 async fn status(State(st): State<AppState>) -> Json<StatusResponse> {
@@ -105,6 +119,8 @@ async fn status(State(st): State<AppState>) -> Json<StatusResponse> {
                 bytes_in: s.counters.bytes_in.load(Relaxed),
                 bytes_out: s.counters.bytes_out.load(Relaxed),
                 active: s.counters.active.load(Relaxed),
+                diagnostics: (s.proto.has_udp() && !s.encrypted)
+                    .then(|| diagnostics_view(&s.diagnostics)),
             }
         })
         .collect();
@@ -119,6 +135,53 @@ async fn status(State(st): State<AppState>) -> Json<StatusResponse> {
         max_port: shared.max_port.load(Relaxed),
         tunnels,
     })
+}
+
+fn diagnostics_view(d: &PlainUdpDiagnostics) -> DiagnosticsView {
+    let rtt = d.rtt.snapshot();
+    let floor = rtt.map(|s| s.min_us);
+    let last = rtt.map(|s| s.last_us);
+    let server_public_to_client = d.server_public_to_client.snapshot();
+    let server_client_to_public = d.server_client_to_public.snapshot();
+    let client_server_to_local = d.client_server_to_local.snapshot();
+    let client_local_to_server = d.client_local_to_server.snapshot();
+    let relay_samples = [
+        server_public_to_client,
+        server_client_to_public,
+        client_server_to_local,
+        client_local_to_server,
+    ];
+
+    DiagnosticsView {
+        rtt_ms: last.map(us_to_ms),
+        network_floor_ms: floor.map(us_to_ms),
+        excess_ms: last
+            .zip(floor)
+            .map(|(last, floor)| us_to_ms(last.saturating_sub(floor))),
+        relay_overhead_ms: mean_avg_ms(&relay_samples),
+        server_public_to_client_ms: avg_ms(server_public_to_client),
+        server_client_to_public_ms: avg_ms(server_client_to_public),
+        client_server_to_local_ms: avg_ms(client_server_to_local),
+        client_local_to_server_ms: avg_ms(client_local_to_server),
+    }
+}
+
+fn avg_ms(snapshot: Option<LatencySnapshot>) -> Option<f64> {
+    snapshot.map(|s| us_to_ms(s.avg_us))
+}
+
+fn mean_avg_ms(snapshots: &[Option<LatencySnapshot>]) -> Option<f64> {
+    let mut total = 0u64;
+    let mut count = 0u64;
+    for snapshot in snapshots.iter().flatten() {
+        total = total.saturating_add(snapshot.avg_us);
+        count += 1;
+    }
+    (count > 0).then(|| us_to_ms(total / count))
+}
+
+fn us_to_ms(us: u64) -> f64 {
+    us as f64 / 1000.0
 }
 
 #[derive(Deserialize)]

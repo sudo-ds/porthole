@@ -22,11 +22,12 @@ use uuid::Uuid;
 
 use crate::client::{ClientShared, Counters};
 use crate::config::UdpSourcePool;
+use crate::diagnostics::{LatencySnapshot, LatencyStats, PlainUdpDiagnostics};
 use crate::protocol::{
     decode_plain_udp, decode_udp, decode_udp_fragment_body, encode_plain_udp, encode_udp,
-    encode_udp_fragment_body, PlainUdpFragment, PlainUdpKind, Wire, UDP_IDLE_TIMEOUT,
-    UDP_PLAINTEXT_FRAGMENT_HEADER, UDP_PLAINTEXT_KEEPALIVE, UDP_PLAINTEXT_MAX_ENCAPSULATED,
-    UDP_PLAINTEXT_MAX_PACKET, UDP_PLAINTEXT_OVERHEAD,
+    encode_udp_fragment_body, PlainUdpFragment, PlainUdpKind, Wire, UDP_DIAGNOSTICS_INTERVAL,
+    UDP_IDLE_TIMEOUT, UDP_PLAINTEXT_FRAGMENT_HEADER, UDP_PLAINTEXT_KEEPALIVE,
+    UDP_PLAINTEXT_MAX_ENCAPSULATED, UDP_PLAINTEXT_MAX_PACKET, UDP_PLAINTEXT_OVERHEAD,
 };
 use crate::server::ServerTls;
 
@@ -41,10 +42,19 @@ const MAX_FLOWS: usize = 4096;
 const PLAIN_REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REASSEMBLY_SETS: usize = 256;
 const MAX_REASSEMBLY_BYTES: usize = 8 * 1024 * 1024;
+const DIAG_TIMESTAMP_BYTES: usize = 8;
+const DIAG_SNAPSHOT_BYTES: usize = 5 * 8;
+const DIAG_PONG_BYTES: usize = DIAG_TIMESTAMP_BYTES + DIAG_SNAPSHOT_BYTES * 2;
 
 // ---------------------------------------------------------------------------
 // Server side
 // ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct PlainUdpServerDiagnostics {
+    public_to_client: LatencyStats,
+    client_to_public: LatencyStats,
+}
 
 /// Pump datagrams between the public UDP socket and the client's data channel until either
 /// side closes or the tunnel is cancelled.
@@ -149,6 +159,7 @@ pub async fn server_plain_forward(
     let mut seq = 0u64;
     let mut reassembly = PlainUdpReassembler::new();
     let mut reassembly_janitor = tokio::time::interval(Duration::from_secs(1));
+    let diagnostics = PlainUdpServerDiagnostics::default();
 
     loop {
         tokio::select! {
@@ -181,8 +192,11 @@ pub async fn server_plain_forward(
                             tracing::trace!("ignored plaintext udp data from unpinned endpoint {peer}");
                             continue;
                         }
+                        let overhead = Instant::now();
                         if let Ok((dst, data)) = decode_udp(body) {
-                            let _ = socket.send_to(data, dst).await;
+                            if socket.send_to(data, dst).await.is_ok() {
+                                diagnostics.client_to_public.record(overhead.elapsed());
+                            }
                         }
                     }
                     Ok((PlainUdpKind::Fragment, _, body)) => {
@@ -200,10 +214,36 @@ pub async fn server_plain_forward(
                         let Some(frame) = reassembly.push(fragment, Instant::now()) else {
                             continue;
                         };
+                        let overhead = Instant::now();
                         if let Ok((dst, data)) = decode_udp(&frame) {
-                            let _ = socket.send_to(data, dst).await;
+                            if socket.send_to(data, dst).await.is_ok() {
+                                diagnostics.client_to_public.record(overhead.elapsed());
+                            }
                         }
                     }
+                    Ok((PlainUdpKind::DiagPing, _, body)) => {
+                        if client != Some(peer) {
+                            tracing::trace!("ignored plaintext udp diagnostic ping from unpinned endpoint {peer}");
+                            continue;
+                        }
+                        let Some(body) = encode_diag_pong_body(body, &diagnostics) else {
+                            tracing::debug!("ignored malformed plaintext udp diagnostic ping");
+                            continue;
+                        };
+                        if let Err(e) = send_plain_udp_packet_to(
+                            &socket,
+                            peer,
+                            &mut seq,
+                            PlainUdpKind::DiagPong,
+                            &body,
+                            &key,
+                        )
+                        .await
+                        {
+                            tracing::debug!("sending plaintext udp diagnostic pong failed: {e:#}");
+                        }
+                    }
+                    Ok((PlainUdpKind::DiagPong, _, _)) => {}
                     Err(_) => {
                         if client == Some(peer) {
                             continue;
@@ -211,12 +251,15 @@ pub async fn server_plain_forward(
                         let Some(client) = client else {
                             continue;
                         };
+                        let overhead = Instant::now();
                         let body = encode_udp(peer, packet);
                         if let Err(e) =
                             send_plain_udp_data_to(&socket, client, &mut seq, &body, &key, udp_mtu)
                                 .await
                         {
                             tracing::debug!("sending plaintext udp datagram to client failed: {e:#}");
+                        } else {
+                            diagnostics.public_to_client.record(overhead.elapsed());
                         }
                     }
                 }
@@ -301,6 +344,7 @@ pub async fn client_plain_channel(
     server_udp: String,
     settings: PlainUdpSettings,
     counters: Arc<Counters>,
+    diagnostics: Arc<PlainUdpDiagnostics>,
     cancel: CancellationToken,
 ) {
     let mut backoff = Duration::from_secs(1);
@@ -309,8 +353,16 @@ pub async fn client_plain_channel(
             break;
         }
         let started = Instant::now();
-        if let Err(e) =
-            run_plain_udp_channel(&tunnel, local, &server_udp, settings, &counters, &cancel).await
+        if let Err(e) = run_plain_udp_channel(
+            &tunnel,
+            local,
+            &server_udp,
+            settings,
+            &counters,
+            &diagnostics,
+            &cancel,
+        )
+        .await
         {
             tracing::warn!("plaintext udp channel for '{tunnel}' failed: {e:#}");
         }
@@ -453,6 +505,7 @@ async fn run_udp_channel(
                             out_tx.clone(),
                             last_seen,
                             counters.clone(),
+                            None,
                             flow_cancel,
                             started,
                         ));
@@ -475,6 +528,7 @@ async fn run_plain_udp_channel(
     server_udp: &str,
     settings: PlainUdpSettings,
     counters: &Arc<Counters>,
+    diagnostics: &Arc<PlainUdpDiagnostics>,
     cancel: &CancellationToken,
 ) -> Result<()> {
     let channel = Arc::new(connect_plain_udp_socket(server_udp).await?);
@@ -491,6 +545,7 @@ async fn run_plain_udp_channel(
         let channel = channel.clone();
         let writer_cancel = link.clone();
         let seq = seq.clone();
+        let started = started;
         tokio::spawn(async move {
             let _ = send_plain_udp_packet(
                 &channel,
@@ -501,11 +556,19 @@ async fn run_plain_udp_channel(
             )
             .await;
             let mut keepalive = tokio::time::interval(UDP_PLAINTEXT_KEEPALIVE);
+            let mut diag_tick = tokio::time::interval(UDP_DIAGNOSTICS_INTERVAL);
+            diag_tick.tick().await;
             loop {
                 tokio::select! {
                     _ = writer_cancel.cancelled() => break,
                     _ = keepalive.tick() => {
                         if send_plain_udp_packet(&channel, PlainUdpKind::Keepalive, &seq, &[], &settings.key).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ = diag_tick.tick() => {
+                        let body = encode_diag_ping_body(epoch_us(&started));
+                        if send_plain_udp_packet(&channel, PlainUdpKind::DiagPing, &seq, &body, &settings.key).await.is_err() {
                             break;
                         }
                     }
@@ -584,8 +647,13 @@ async fn run_plain_udp_channel(
                         };
                         frame
                     }
+                    PlainUdpKind::DiagPong => {
+                        record_diag_pong(body, &started, diagnostics);
+                        continue;
+                    }
                     _ => continue,
                 };
+                let overhead = Instant::now();
                 let (src, data) = match decode_udp(&frame) { Ok(x) => x, Err(_) => continue };
                 counters.bytes_in.fetch_add(data.len() as u64, Relaxed);
                 let now = epoch_ms(&started);
@@ -627,13 +695,16 @@ async fn run_plain_udp_channel(
                             out_tx.clone(),
                             last_seen,
                             counters.clone(),
+                            Some(diagnostics.clone()),
                             flow_cancel,
                             started,
                         ));
                         sock
                     }
                 };
-                let _ = sock.send(data).await;
+                if sock.send(data).await.is_ok() {
+                    diagnostics.client_server_to_local.record(overhead.elapsed());
+                }
             }
         }
     }
@@ -651,6 +722,7 @@ async fn flow_reader(
     out_tx: mpsc::Sender<Bytes>,
     last_seen: Arc<AtomicU64>,
     counters: Arc<Counters>,
+    diagnostics: Option<Arc<PlainUdpDiagnostics>>,
     cancel: CancellationToken,
     started: Instant,
 ) {
@@ -662,8 +734,13 @@ async fn flow_reader(
                 Ok(n) => {
                     last_seen.store(epoch_ms(&started), Relaxed);
                     counters.bytes_out.fetch_add(n as u64, Relaxed);
+                    let overhead = Instant::now();
                     // try_send: if the link is backed up, drop rather than block or buffer.
-                    let _ = out_tx.try_send(encode_udp(src, &buf[..n]));
+                    if out_tx.try_send(encode_udp(src, &buf[..n])).is_ok() {
+                        if let Some(diagnostics) = &diagnostics {
+                            diagnostics.client_local_to_server.record(overhead.elapsed());
+                        }
+                    }
                 }
                 Err(e) => { tracing::debug!("flow recv: {e}"); break; }
             }
@@ -683,6 +760,22 @@ async fn send_plain_udp_packet(
         return Ok(());
     };
     channel.send(&packet).await?;
+    Ok(())
+}
+
+async fn send_plain_udp_packet_to(
+    socket: &UdpSocket,
+    dst: SocketAddr,
+    seq: &mut u64,
+    kind: PlainUdpKind,
+    body: &[u8],
+    key: &[u8; 32],
+) -> Result<()> {
+    let Some(packet) = encode_plain_udp(kind, next_seq(seq), body, key) else {
+        tracing::debug!("dropping udp plaintext packet that exceeds no-fragment packet limit");
+        return Ok(());
+    };
+    socket.send_to(&packet, dst).await?;
     Ok(())
 }
 
@@ -713,6 +806,79 @@ async fn send_plain_udp_data_to(
         socket.send_to(&packet, dst).await?;
     }
     Ok(())
+}
+
+fn encode_diag_ping_body(sent_us: u64) -> Bytes {
+    Bytes::copy_from_slice(&sent_us.to_be_bytes())
+}
+
+fn encode_diag_pong_body(
+    ping_body: &[u8],
+    diagnostics: &PlainUdpServerDiagnostics,
+) -> Option<Bytes> {
+    if ping_body.len() < DIAG_TIMESTAMP_BYTES {
+        return None;
+    }
+    let mut out = Vec::with_capacity(DIAG_PONG_BYTES);
+    out.extend_from_slice(&ping_body[..DIAG_TIMESTAMP_BYTES]);
+    append_latency_snapshot(&mut out, diagnostics.public_to_client.snapshot());
+    append_latency_snapshot(&mut out, diagnostics.client_to_public.snapshot());
+    Some(Bytes::from(out))
+}
+
+fn record_diag_pong(body: &[u8], started: &Instant, diagnostics: &PlainUdpDiagnostics) {
+    let Some(sent_us) = read_u64(body, 0) else {
+        return;
+    };
+    diagnostics.rtt.record(Duration::from_micros(
+        epoch_us(started).saturating_sub(sent_us),
+    ));
+
+    if body.len() < DIAG_PONG_BYTES {
+        return;
+    }
+    if let Some(snapshot) = decode_latency_snapshot(body, DIAG_TIMESTAMP_BYTES) {
+        diagnostics.server_public_to_client.store(snapshot);
+    }
+    if let Some(snapshot) =
+        decode_latency_snapshot(body, DIAG_TIMESTAMP_BYTES + DIAG_SNAPSHOT_BYTES)
+    {
+        diagnostics.server_client_to_public.store(snapshot);
+    }
+}
+
+fn append_latency_snapshot(out: &mut Vec<u8>, snapshot: Option<LatencySnapshot>) {
+    let values = match snapshot {
+        Some(s) => [s.samples, s.last_us, s.avg_us, s.min_us, s.max_us],
+        None => [0, 0, 0, 0, 0],
+    };
+    for value in values {
+        out.extend_from_slice(&value.to_be_bytes());
+    }
+}
+
+fn decode_latency_snapshot(body: &[u8], offset: usize) -> Option<Option<LatencySnapshot>> {
+    let samples = read_u64(body, offset)?;
+    let last_us = read_u64(body, offset + 8)?;
+    let avg_us = read_u64(body, offset + 16)?;
+    let min_us = read_u64(body, offset + 24)?;
+    let max_us = read_u64(body, offset + 32)?;
+    if samples == 0 {
+        return Some(None);
+    }
+    Some(Some(LatencySnapshot {
+        samples,
+        last_us,
+        avg_us,
+        min_us,
+        max_us,
+    }))
+}
+
+fn read_u64(body: &[u8], offset: usize) -> Option<u64> {
+    let end = offset.checked_add(8)?;
+    let bytes = body.get(offset..end)?;
+    Some(u64::from_be_bytes(bytes.try_into().ok()?))
 }
 
 fn encode_plain_udp_data_packets(
@@ -859,6 +1025,10 @@ async fn bind_local_flow(
 /// Milliseconds elapsed since `started`; the monotonic timestamp stored per flow.
 fn epoch_ms(started: &Instant) -> u64 {
     started.elapsed().as_millis() as u64
+}
+
+fn epoch_us(started: &Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 fn next_seq(seq: &mut u64) -> u64 {
@@ -1170,6 +1340,68 @@ mod tests {
         let mut seq = 0u64;
         let mtu = (UDP_PLAINTEXT_OVERHEAD + UDP_PLAINTEXT_FRAGMENT_HEADER) as u16;
         assert!(encode_plain_udp_data_packets(&body, &key, mtu, || next_seq(&mut seq)).is_err());
+    }
+
+    #[test]
+    fn plaintext_udp_diagnostic_pong_carries_server_snapshots() {
+        let server = PlainUdpServerDiagnostics::default();
+        server.public_to_client.record(Duration::from_micros(11));
+        server.client_to_public.record(Duration::from_micros(17));
+
+        let body = encode_diag_pong_body(&encode_diag_ping_body(0), &server).unwrap();
+        let client = PlainUdpDiagnostics::default();
+        record_diag_pong(&body, &Instant::now(), &client);
+
+        assert!(client.rtt.snapshot().is_some());
+        assert_eq!(
+            client.server_public_to_client.snapshot().unwrap().avg_us,
+            11
+        );
+        assert_eq!(
+            client.server_client_to_public.snapshot().unwrap().avg_us,
+            17
+        );
+        assert!(encode_diag_pong_body(b"short", &server).is_none());
+    }
+
+    #[tokio::test]
+    async fn server_plain_forward_replies_to_diagnostic_ping() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = socket.local_addr().unwrap();
+        let token = Uuid::new_v4();
+        let key = [5u8; 32];
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(server_plain_forward(
+            socket,
+            token,
+            key,
+            crate::protocol::DEFAULT_UDP_MTU,
+            cancel.clone(),
+        ));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let hello = encode_plain_udp(PlainUdpKind::Hello, 0, token.as_bytes(), &key).unwrap();
+        client.send_to(&hello, server_addr).await.unwrap();
+        let ping =
+            encode_plain_udp(PlainUdpKind::DiagPing, 1, &encode_diag_ping_body(0), &key).unwrap();
+        client.send_to(&ping, server_addr).await.unwrap();
+
+        let mut buf = [0u8; 256];
+        let (n, peer) = timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer, server_addr);
+        let (kind, _, body) = decode_plain_udp(&buf[..n], &key).unwrap();
+        assert_eq!(kind, PlainUdpKind::DiagPong);
+        assert_eq!(&body[..DIAG_TIMESTAMP_BYTES], &0u64.to_be_bytes());
+
+        cancel.cancel();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

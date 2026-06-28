@@ -40,6 +40,7 @@ pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
 pub const ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const UDP_PLAINTEXT_KEEPALIVE: Duration = Duration::from_secs(5);
+pub const UDP_DIAGNOSTICS_INTERVAL: Duration = Duration::from_secs(5);
 /// Default native UDP relay packet size, excluding outer IP/UDP headers.
 pub const DEFAULT_UDP_MTU: u16 = 1200;
 pub const MIN_UDP_MTU: u16 = 256;
@@ -301,6 +302,8 @@ pub enum PlainUdpKind {
     Data,
     Keepalive,
     Fragment,
+    DiagPing,
+    DiagPong,
 }
 
 impl PlainUdpKind {
@@ -310,6 +313,8 @@ impl PlainUdpKind {
             Self::Data => 2,
             Self::Keepalive => 3,
             Self::Fragment => 4,
+            Self::DiagPing => 5,
+            Self::DiagPong => 6,
         }
     }
 
@@ -319,6 +324,8 @@ impl PlainUdpKind {
             2 => Ok(Self::Data),
             3 => Ok(Self::Keepalive),
             4 => Ok(Self::Fragment),
+            5 => Ok(Self::DiagPing),
+            6 => Ok(Self::DiagPong),
             other => bail!("invalid plaintext udp packet kind {other}"),
         }
     }
@@ -590,6 +597,18 @@ mod tests {
         let mut tampered = packet.to_vec();
         tampered[14] ^= 0x01;
         assert!(decode_plain_udp(&tampered, &key).is_err());
+    }
+
+    #[test]
+    fn plaintext_udp_diagnostic_packets_roundtrip() {
+        let key = [8u8; 32];
+        for kind in [PlainUdpKind::DiagPing, PlainUdpKind::DiagPong] {
+            let packet = encode_plain_udp(kind, 7, b"diagnostic", &key).unwrap();
+            let (got_kind, seq, body) = decode_plain_udp(&packet, &key).unwrap();
+            assert_eq!(got_kind, kind);
+            assert_eq!(seq, 7);
+            assert_eq!(body, b"diagnostic");
+        }
     }
 
     #[test]
