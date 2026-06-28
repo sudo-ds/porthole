@@ -64,7 +64,7 @@
   }
   .meta span { color:var(--fg); }
   main {
-    width:min(1240px, calc(100% - 36px));
+    width:min(1520px, calc(100% - 24px));
     margin:0 auto;
     padding:36px 0 56px;
   }
@@ -91,10 +91,19 @@
   }
   table {
     width:100%;
-    min-width:1140px;
+    min-width:1280px;
+    table-layout:fixed;
     border-collapse:separate;
     border-spacing:0;
   }
+  col.name-col { width:10%; }
+  col.proto-col { width:25%; }
+  col.local-col { width:14%; }
+  col.public-col { width:14%; }
+  col.metric-col { width:5.5%; }
+  col.conns-col { width:5%; }
+  col.diag-col { width:7%; }
+  col.actions-col { width:14%; }
   th, td { text-align:left; }
   th {
     padding:14px 14px 12px;
@@ -112,9 +121,9 @@
   }
   tbody tr { transition:background 140ms ease; }
   tbody tr:hover { background:rgba(156,207,159,0.035); }
-  .name-cell { display:flex; align-items:center; gap:12px; min-width:150px; }
-  .name-cell strong { font-size:15px; font-weight:700; overflow-wrap:anywhere; }
-  .proto-cell { display:flex; align-items:center; gap:7px; flex-wrap:wrap; min-width:190px; }
+  .name-cell { display:flex; align-items:center; gap:12px; min-width:0; white-space:nowrap; }
+  .name-cell strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:15px; font-weight:700; }
+  .proto-cell { display:flex; align-items:center; gap:7px; flex-wrap:nowrap; min-width:0; }
   .endpoint {
     font:13px/1.45 "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
     color:var(--fg);
@@ -125,7 +134,7 @@
   td.public a:hover { text-decoration:underline; text-underline-offset:3px; }
   td.public .public-endpoint { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
   .metric {
-    width:96px;
+    min-width:72px;
     text-align:right;
     font:13px/1.45 "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
     font-variant-numeric:tabular-nums;
@@ -140,8 +149,8 @@
   .diag-cell { display:flex; flex-direction:column; gap:2px; }
   .diag-sub { color:var(--muted); font-size:11px; }
   .muted-mono { color:var(--muted-2); font:13px/1.45 "JetBrains Mono", "Cascadia Mono", Consolas, monospace; }
-  td.actions { width:168px; }
-  .action-buttons { display:grid; grid-template-columns:78px 78px; gap:8px; align-items:center; }
+  td.actions { width:176px; }
+  .action-buttons { display:grid; grid-template-columns:80px 80px; gap:8px; align-items:center; }
   .action-buttons button { width:100%; text-align:center; }
   .pill {
     display:inline-flex;
@@ -195,7 +204,7 @@
   .add-section { margin-top:32px; }
   form {
     display:grid;
-    grid-template-columns:minmax(150px,1.1fr) 92px 116px 104px minmax(230px,1.6fr) minmax(150px,1fr) 112px auto;
+    grid-template-columns:minmax(160px,1.2fr) minmax(92px,0.6fr) minmax(120px,0.8fr) minmax(104px,0.65fr) minmax(240px,1.8fr) minmax(160px,1fr) minmax(112px,0.75fr) minmax(96px,0.5fr);
     grid-template-areas:
       "name proto encryption mtu local remote proxy submit"
       "sourcepool sourcepool sourcepool sourcepool sourcepool sourcepool sourcepool sourcepool";
@@ -215,6 +224,13 @@
     color:var(--muted);
     font-size:12px;
     font-weight:600;
+  }
+  .label-row {
+    display:flex;
+    align-items:baseline;
+    gap:6px;
+    min-width:0;
+    white-space:nowrap;
   }
   input, select {
     width:100%;
@@ -247,6 +263,7 @@
     .meta { width:100%; margin-left:21px; justify-content:flex-start; text-align:left; }
     .table-wrap { overflow:visible; border:0; }
     table, thead, tbody, tr, td { display:block; min-width:0; width:100%; }
+    colgroup { display:none; }
     thead { display:none; }
     tbody tr {
       margin-bottom:12px;
@@ -287,6 +304,8 @@
     #pauseBtn { width:100%; }
     td { grid-template-columns:1fr; gap:5px; }
     .endpoint { white-space:normal; overflow-wrap:anywhere; }
+    .proto-cell { flex-wrap:wrap; }
+    .name-cell strong { white-space:normal; overflow-wrap:anywhere; }
     form { grid-template-columns:1fr; padding:14px; }
   }
 </style>
@@ -312,6 +331,17 @@
   </div>
   <div class="table-wrap">
     <table aria-label="Tunnels">
+      <colgroup>
+        <col class="name-col">
+        <col class="proto-col">
+        <col class="local-col">
+        <col class="public-col">
+        <col class="metric-col">
+        <col class="metric-col">
+        <col class="conns-col">
+        <col class="diag-col">
+        <col class="actions-col">
+      </colgroup>
       <thead><tr>
         <th>Name</th><th>Proto</th><th>Local</th><th>Public</th>
         <th>In</th><th>Out</th><th>Conns</th><th>Diag</th><th></th>
@@ -330,7 +360,7 @@
       <label id="mtuLabel" class="field-mtu">UDP MTU<input name="udp_mtu" type="number" min="256" max="65507" placeholder="1200"></label>
       <label id="poolLabel" class="field-source-pool">UDP source pool<input name="udp_source_pool" placeholder="127.64.0.0/16"></label>
       <label class="field-local">Local address<input name="local" placeholder="25565 or 127.0.0.1:25565" required></label>
-      <label class="field-remote">Public port <small id="range" class="hint"></small><input name="remote_port" type="number" min="0" max="65535" placeholder="25565"></label>
+      <label class="field-remote"><span class="label-row">Public port <small id="range" class="hint"></small></span><input name="remote_port" type="number" min="0" max="65535" placeholder="25565"></label>
       <label id="proxyLabel" class="field-proxy">Proxy<select name="proxy_protocol"><option value="off">Off</option><option value="v1">PROXY v1</option><option value="v2">PROXY v2</option></select></label>
       <button class="primary field-submit" type="submit">Add</button>
     </form>

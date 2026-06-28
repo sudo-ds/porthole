@@ -1,6 +1,6 @@
 [package]
 name = "porthole"
-version = "0.5.5"
+version = "0.5.6"
 edition = "2021"
 description = "Self-hosted TCP/UDP tunneling & relay service (a simple, self-hosted ngrok/playit.gg/bore alternative)"
 license = "MIT"
